@@ -49,3 +49,4 @@ endif
 
 obj-$(NAUT_CONFIG_PARALLEL_PORT_GPIO) += port_gpio.o
 
+obj-$(NAUT_CONFIG_NVME) += nvme.o

@@ -1,11 +1,13 @@
 
 ifdef QEMU
 
-QEMU_FLAGS += -smp cpus=4
+QEMU_FLAGS += -smp cpus=2
 QEMU_FLAGS += -serial stdio
 #QEMU_FLAGS += -display none
 QEMU_FLAGS += -m 2G
 #QEMU_FLAGS += -device virtio-net-pci -nic socket,udp=1000,localaddr=localhost
+QEMU_FLAGS += -drive file=nvm.img,if=none,id=nvm
+QEMU_FLAGS += -device nvme,serial=deadbeef,drive=nvm
 
 qemu: $(QEMU_DEPS)
 	$(call quiet-cmd,QEMU,)

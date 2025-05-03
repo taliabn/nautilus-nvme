@@ -462,6 +462,20 @@ config DEBUG_VESA
     help
        Add debugging output from VESA driver
 
+config NVME
+    bool "NVME Support"
+    depends on ARCH_X86
+    default n
+    help 
+       Adds work in progress NVME driver
+
+config DEBUG_NVME
+    bool "Debug NVME Support"
+    depends on DEBUG_PRINTS && NVME
+    default n
+    help
+      Turn on debug prints for NVME devices
+
 endmenu
 
     
