@@ -24,6 +24,7 @@
 
 #include <nautilus/nautilus.h>
 #include <dev/nvme.h>
+#include <nautilus/shell.h>
 
 #ifndef NAUT_CONFIG_DEBUG_NVME
 #undef DEBUG_PRINT
@@ -46,3 +47,16 @@ void nk_nvme_deinit()
 {
     INFO("deinit\n");
 }
+
+static int handle_nvmetest (char * buf, void * priv)
+{
+    nk_vc_printf("hello from nvme test!\n");
+    return 0;
+}
+
+static struct shell_cmd_impl nvmetest_impl = {
+    .cmd      = "nvmetest",
+    .help_str = "nvmetest dev",
+    .handler  = handle_nvmetest,
+};
+nk_register_shell_cmd(nvmetest_impl);
