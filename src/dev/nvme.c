@@ -37,6 +37,40 @@
 
 /* Work in progress NVMe driver*/
 
+struct nvme_queue {
+    uint64_t addr;
+    uint64_t size;
+};
+
+struct nvme_sq {
+    struct nvme_queue; 
+};
+
+struct nvme_cq {
+    struct nvme_queue;
+};
+
+
+struct nvme_dev { // Based off of Rust drivers
+
+    struct nk_dev; // necessary that it's first field (allegedly)
+
+    char* pci_addr;
+    uint8_t* addr;
+    int len;
+    uint16_t dstrd;
+    struct nvme_sq admin_sq;
+    struct nvme_cq admin_cq;
+    struct nvme_sq io_sq; // For now 1
+    struct nvme_cq io_cq; // For now 1
+    uint8_t buffer; // Suggets 2 MiB buffer, but probably unnecesary since Nautilus doesn't page
+    uint64_t prp_list[512];
+    uint32_t* namespaces; // For now empty, can implement as linked list
+    // stats?
+    uint16_t q_id;
+};
+
+
 int nk_nvme_init(struct naut_info *naut)
 {
     INFO("init\n");

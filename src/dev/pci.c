@@ -1602,7 +1602,7 @@ int pci_dev_is_pending_msi(struct pci_dev *dev, int msi_num)
 #define WRITEQ(p,v) __asm__ __volatile__ ("movq %0, (%1)" : : "r"(v), "r"(p) : "memory")
 #define READQ(p,v) __asm__ __volatile__ ("movq (%1), %0" : "=r"(v) :"r"(p) : "memory")
 #else
-#error "NAUT_CONFIG_USE_PCI_ECAM is undefined for architeture other than x86!"
+#error "NAUT_CONFIG_USE_PCI_ECAM is undefined for architecture other than x86!"
 #endif
 #endif
 
