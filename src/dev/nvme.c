@@ -25,6 +25,7 @@
 #include <nautilus/nautilus.h>
 #include <dev/nvme.h>
 #include <nautilus/shell.h>
+#include <nautilus/dev.h>
 
 #ifndef NAUT_CONFIG_DEBUG_NVME
 #undef DEBUG_PRINT
@@ -43,17 +44,16 @@ struct nvme_queue {
 };
 
 struct nvme_sq {
-    struct nvme_queue; 
+    struct nvme_queue sq; 
 };
 
 struct nvme_cq {
-    struct nvme_queue;
+    struct nvme_queue cq;
 };
-
 
 struct nvme_dev { // Based off of Rust drivers
 
-    struct nk_dev; // necessary that it's first field (allegedly)
+    struct nk_dev dev; // necessary that it's first field (allegedly)
 
     char* pci_addr;
     uint8_t* addr;
