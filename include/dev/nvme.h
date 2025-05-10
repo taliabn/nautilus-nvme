@@ -22,6 +22,11 @@
  * redistribute, and modify it as specified in the file "LICENSE.txt".
  */
 
+// Sources:
+    // https://github.com/torvalds/linux/tree/master/drivers/nvme
+    // https://github.com/freebsd/freebsd-src/tree/main/sys/dev/nvme
+    // https://wiki.osdev.org/NVMe
+
 #ifndef __NVME_H__
 #define __NVME_H__
 
@@ -71,6 +76,26 @@ enum nvme_opcode {
     NVME_OPC_ZONE_MGMT_RECV = 0x7a,
     NVME_OPC_ZONE_APPEND    = 0x7d,
     NVME_OPC_VENDOR_START   = 0x80,
+};
+
+/* admin opcodes */
+enum nvme_admin_opcode {
+	NVME_OPC_DELETE_IO_SQ			= 0x00,
+	NVME_OPC_CREATE_IO_SQ			= 0x01,
+	NVME_OPC_GET_LOG_PAGE			= 0x02,
+	NVME_OPC_DELETE_IO_CQ			= 0x04,
+	NVME_OPC_CREATE_IO_CQ			= 0x05,
+	NVME_OPC_IDENTIFY			    = 0x06,
+	NVME_OPC_ABORT				    = 0x08,
+	NVME_OPC_SET_FEATURES			= 0x09,
+	NVME_OPC_GET_FEATURES			= 0x0a,
+};
+
+// for identify admin command, which subsystem to get info about
+enum nvme_identify_cns{
+    NAMESPACE       = 0x00,
+    CONTROLLER      = 0x01,
+    NAMESPACE_LIST  = 0x02,
 };
 
 /* completion queue entry */
