@@ -42,14 +42,33 @@ struct nvme_queue {
     uint64_t size;
 };
 
-struct nvme_sq {
-    struct nvme_queue; 
-};
+typedef struct nvme_queue nvme_sq;
 
-struct nvme_cq {
-    struct nvme_queue;
-};
+typedef struct nvme_queue nvme_cq;
 
+
+// Currently very based on OSDev, should modify to be more Nautilus
+int create_admin_submission_queue(nvme_sq *sq) {
+	sq->addr = (uint64_t)malloc(PAGE_SIZE); // IDK if this is still valid without paging
+	if (sq->addr == 0) {
+		return 1;
+    }
+	sq->size = 63;
+	// 0x28 is the Admin Submission queue register
+	nvme_write_reg(0x28, sq->addr);
+	return 0;
+}
+
+int create_admin_completion_queue(nvme_cq *cq) {
+	cq->addr = (uint64_t)malloc(PAGE_SIZE);
+	if (cq->addr == 0) {
+		return 1;
+    }
+	cq->size = 63;
+	// 0x30 is the Admin Completion queue register
+	nvme_write_reg(0x30, cq->addr);
+	return 0;
+}
 
 struct nvme_dev { // Based off of Rust drivers
 
@@ -59,10 +78,10 @@ struct nvme_dev { // Based off of Rust drivers
     uint8_t* addr;
     int len;
     uint16_t dstrd;
-    struct nvme_sq admin_sq;
-    struct nvme_cq admin_cq;
-    struct nvme_sq io_sq; // For now 1
-    struct nvme_cq io_cq; // For now 1
+    nvme_sq admin_sq;
+    nvme_cq admin_cq;
+    nvme_sq io_sq; // For now 1
+    nvme_cq io_cq; // For now 1
     uint8_t buffer; // Suggets 2 MiB buffer, but probably unnecesary since Nautilus doesn't page
     uint64_t prp_list[512];
     uint32_t* namespaces; // For now empty, can implement as linked list
@@ -74,6 +93,18 @@ struct nvme_dev { // Based off of Rust drivers
 int nk_nvme_init(struct naut_info *naut)
 {
     INFO("init\n");
+    struct nvme_dev device; // Should be Malloc-d and passed onto device tree?
+
+    if (create_admin_submission_queue(&(device.admin_sq)) ||
+        create_admin_completion_queue(&(device.admin_cq))) 
+    {
+        ERROR("Failure to create admin queues\n");
+        return 1;
+    }
+
+    // Creation of the IO queues is done WITH 
+    // NVMe commands on the admin queues?
+
     return 0;
 }
 
