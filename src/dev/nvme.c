@@ -126,12 +126,12 @@ static int nvme_queue_submit_cmd(struct nvme_queue *queue, struct nvme_command *
 
 static int nvme_submit_admin_cmd(struct nvme_dev *nvme, struct nvme_command *cmd)
 {
-    return nvme_queue_submit_cmd(&((nvme->admin_sq).sq), cmd);
+    return nvme_queue_submit_cmd(&(nvme->admin_sq), cmd);
 }
 
 static int nvme_submit_io_cmd(struct nvme_dev *nvme, struct nvme_command *cmd)
 {
-    return nvme_queue_submit_cmd(&((nvme->io_sq).sq), cmd);
+    return nvme_queue_submit_cmd(&(nvme->io_sq), cmd);
 }
 
 /* IO Commands */
@@ -189,25 +189,25 @@ int nvme_identify_ns_cmd(struct nvme_dev *nvme, void *buff, uint32_t nsid){
     return nvme_submit_admin_cmd(nvme, &cmd);
 }
 
-int nvme_create_io_sq_cmd(struct nvme_dev *nvme, uint16_t sq_id, uint16_t cq_id, struct nvme_sq * io_sq){
+int nvme_create_io_sq_cmd(struct nvme_dev *nvme, uint16_t sq_id, uint16_t cq_id, nvme_sq *io_sq){
     struct nvme_command cmd;
     memset(&cmd, 0, sizeof(cmd));
 
 	cmd.opc = NVME_OPC_CREATE_IO_SQ;
-	cmd.prp1 = htole64(io_sq->sq.addr);
-	cmd.cdw10 = htole32(((io_sq->sq.size-1) << 16) | sq_id);
+	cmd.prp1 = htole64(io_sq->addr);
+	cmd.cdw10 = htole32(((io_sq->size-1) << 16) | sq_id);
 	cmd.cdw11 = htole32((cq_id << 16) | 0x01);
     
     return nvme_submit_admin_cmd(nvme, &cmd); 
 }
 
-int nvme_create_io_cq_cmd(struct nvme_dev *nvme, uint16_t cq_id, struct nvme_cq * io_cq){
+int nvme_create_io_cq_cmd(struct nvme_dev *nvme, uint16_t cq_id, nvme_cq *io_cq){
     struct nvme_command cmd;
     memset(&cmd, 0, sizeof(cmd));
 
 	cmd.opc = NVME_OPC_CREATE_IO_CQ;
-	cmd.prp1 = htole64(io_cq->cq.addr);
-	cmd.cdw10 = htole32(((io_cq->cq.size-1) << 16) | cq_id);
+	cmd.prp1 = htole64(io_cq->addr);
+	cmd.cdw10 = htole32(((io_cq->size-1) << 16) | cq_id);
     // TODO: are we enabling interrupts? for now let's say no. 
     // otherwise, specify MSI vector + 1 in highword of DWORD11
 	/* flags 0x1 = interrupts not enabled, physically contiguous */
