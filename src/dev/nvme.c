@@ -39,6 +39,7 @@
 
 /* Work in progress NVMe driver*/
 
+// types
 struct nvme_queue {
     uint64_t addr;
     uint64_t size;
@@ -48,6 +49,29 @@ typedef struct nvme_queue nvme_sq;
 
 typedef struct nvme_queue nvme_cq;
 
+struct nvme_dev { // Based off of Rust drivers
+
+    struct nk_dev dev; // necessary that it's first field (allegedly)
+
+    char* pci_addr;
+    uint8_t* addr;
+    int len;
+    uint16_t dstrd;
+    nvme_sq admin_sq;
+    nvme_cq admin_cq;
+    nvme_sq io_sq; // For now 1
+    nvme_cq io_cq; // For now 1
+    uint8_t buffer; // Suggets 2 MiB buffer, but probably unnecesary since Nautilus doesn't page
+    uint64_t prp_list[512];
+    uint32_t* namespaces; // For now empty, can implement as linked list
+    // stats?
+    uint16_t q_id;
+};
+
+// forward declarations:
+int nvme_create_io_sq_cmd(struct nvme_dev *nvme, uint16_t sq_id, uint16_t cq_id, nvme_sq *io_sq);
+int nvme_create_io_cq_cmd(struct nvme_dev *nvme, uint16_t cq_id, nvme_cq *io_cq);
+void nvme_write_reg(uint32_t offset, uint32_t value){}; // TODO: actually write this
 
 // Currently very based on OSDev, should modify to be more Nautilus
 int create_admin_submission_queue(nvme_sq *sq) {
@@ -72,25 +96,28 @@ int create_admin_completion_queue(nvme_cq *cq) {
 	return 0;
 }
 
-struct nvme_dev { // Based off of Rust drivers
+int create_io_submission_queue(struct nvme_dev *nvme, nvme_sq *sq) {
+	sq->addr = (uint64_t)malloc(PAGE_SIZE); // IDK if this is still valid without paging
+	if (sq->addr == 0) {
+		return 1;
+    }
+	sq->size = 63;
+    // since we only have one io queue pair, just set id=0
+    uint16_t sq_id = 0;
+    uint16_t cq_id = 0;
+	return nvme_create_io_sq_cmd(nvme, sq_id, cq_id, sq);
+}
 
-    struct nk_dev dev; // necessary that it's first field (allegedly)
-
-    char* pci_addr;
-    uint8_t* addr;
-    int len;
-    uint16_t dstrd;
-    nvme_sq admin_sq;
-    nvme_cq admin_cq;
-    nvme_sq io_sq; // For now 1
-    nvme_cq io_cq; // For now 1
-    uint8_t buffer; // Suggets 2 MiB buffer, but probably unnecesary since Nautilus doesn't page
-    uint64_t prp_list[512];
-    uint32_t* namespaces; // For now empty, can implement as linked list
-    // stats?
-    uint16_t q_id;
-};
-
+int create_io_completion_queue(struct nvme_dev *nvme, nvme_cq *cq) {
+	cq->addr = (uint64_t)malloc(PAGE_SIZE);
+	if (cq->addr == 0) {
+		return 1;
+    }
+	cq->size = 63;
+    // since we only have one io queue pair, just set id=0
+    uint16_t cq_id = 0;
+	return nvme_create_io_cq_cmd(nvme, cq_id, cq);
+}
 
 int nk_nvme_init(struct naut_info *naut)
 {
@@ -105,8 +132,14 @@ int nk_nvme_init(struct naut_info *naut)
     }
 
     // Creation of the IO queues is done WITH 
-    // NVMe commands on the admin queues?
-
+    // NVMe commands on the admin queues
+    if (create_io_submission_queue(&device, &(device.io_sq)) ||
+        create_io_completion_queue(&device, &(device.io_cq))) 
+    {
+        ERROR("Failure to create admin queues\n");
+        return 1;
+    }
+    
     return 0;
 }
 
