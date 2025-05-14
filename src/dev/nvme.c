@@ -26,6 +26,7 @@
 #include <dev/nvme.h>
 #include <nautilus/shell.h>
 #include <nautilus/dev.h>
+#include <nautilus/endian.h>
 
 #ifndef NAUT_CONFIG_DEBUG_NVME
 #undef DEBUG_PRINT
@@ -114,9 +115,120 @@ void nk_nvme_deinit()
     INFO("deinit\n");
 }
 
-static int handle_nvmetest (char * buf, void * priv)
+/* Command submisison helper functions */
+
+static int nvme_queue_submit_cmd(struct nvme_queue *queue, struct nvme_command *cmd){
+    DEBUG("command successfully submitted!\n");
+    // TODO replace with actual function...
+    // should also probably do something with the completion
+    return 0;
+}
+
+static int nvme_submit_admin_cmd(struct nvme_dev *nvme, struct nvme_command *cmd)
+{
+    return nvme_queue_submit_cmd(&((nvme->admin_sq).sq), cmd);
+}
+
+static int nvme_submit_io_cmd(struct nvme_dev *nvme, struct nvme_command *cmd)
+{
+    return nvme_queue_submit_cmd(&((nvme->io_sq).sq), cmd);
+}
+
+/* IO Commands */
+
+static int nvme_rw_cmd(struct nvme_dev *nvme, uint8_t opc, uint32_t nsid, 
+                void *buff, uint64_t lba, uint32_t num_blocks)
+{
+    struct nvme_command cmd;
+    memset(&cmd, 0, sizeof(cmd));
+
+	cmd.opc = opc;
+	cmd.nsid = htole32(nsid);
+	cmd.prp1 = (uintptr_t)buff;
+    cmd.cdw10 = htole32(lba & 0xffffffffu);
+	cmd.cdw11 = htole32(lba >> 32);
+	cmd.cdw12 = htole32(num_blocks-1);
+
+    return nvme_submit_io_cmd(nvme, &cmd);
+}
+
+int nvme_write_cmd(struct nvme_dev *nvme, uint32_t nsid, void *buff,
+    uint64_t lba, uint32_t num_blocks)
+{
+	return nvme_rw_cmd(nvme, NVME_OPC_WRITE, nsid, buff, lba, num_blocks);
+}
+
+int nvme_read_cmd(struct nvme_dev *nvme, uint32_t nsid, void *buff, 
+    uint64_t lba, uint32_t num_blocks)
+{
+	return nvme_rw_cmd(nvme, NVME_OPC_READ, nsid, buff, lba, num_blocks);
+}
+
+/* Admin Commands */
+
+int nvme_identify_controller_cmd(struct nvme_dev *nvme, void *buff){
+    struct nvme_command cmd;
+    memset(&cmd, 0, sizeof(cmd));
+
+	cmd.opc = NVME_OPC_IDENTIFY;
+	cmd.prp1 = (uintptr_t)buff; // command output (a single page)
+    cmd.cdw10 = htole32(CONTROLLER);
+
+    return nvme_submit_admin_cmd(nvme, &cmd);
+}
+
+int nvme_identify_ns_cmd(struct nvme_dev *nvme, void *buff, uint32_t nsid){
+    struct nvme_command cmd;
+    memset(&cmd, 0, sizeof(cmd));
+
+	cmd.opc = NVME_OPC_IDENTIFY;
+	cmd.nsid = htole32(nsid);
+	cmd.prp1 = (uintptr_t)buff; // command output (a single page)
+    cmd.cdw10 = htole32(NAMESPACE);
+
+    return nvme_submit_admin_cmd(nvme, &cmd);
+}
+
+int nvme_create_io_sq_cmd(struct nvme_dev *nvme, uint16_t sq_id, uint16_t cq_id, struct nvme_sq * io_sq){
+    struct nvme_command cmd;
+    memset(&cmd, 0, sizeof(cmd));
+
+	cmd.opc = NVME_OPC_CREATE_IO_SQ;
+	cmd.prp1 = htole64(io_sq->sq.addr);
+	cmd.cdw10 = htole32(((io_sq->sq.size-1) << 16) | sq_id);
+	cmd.cdw11 = htole32((cq_id << 16) | 0x01);
+    
+    return nvme_submit_admin_cmd(nvme, &cmd); 
+}
+
+int nvme_create_io_cq_cmd(struct nvme_dev *nvme, uint16_t cq_id, struct nvme_cq * io_cq){
+    struct nvme_command cmd;
+    memset(&cmd, 0, sizeof(cmd));
+
+	cmd.opc = NVME_OPC_CREATE_IO_CQ;
+	cmd.prp1 = htole64(io_cq->cq.addr);
+	cmd.cdw10 = htole32(((io_cq->cq.size-1) << 16) | cq_id);
+    // TODO: are we enabling interrupts? for now let's say no. 
+    // otherwise, specify MSI vector + 1 in highword of DWORD11
+	/* flags 0x1 = interrupts not enabled, physically contiguous */
+	cmd.cdw11 = htole32(0x01);
+    
+    return nvme_submit_admin_cmd(nvme, &cmd); 
+}
+
+// this is a fairly meaningless test for now
+static int handle_nvmetest (char *buf, void *priv)
 {
     nk_vc_printf("hello from nvme test!\n");
+    struct nvme_dev nvme;
+    uint8_t data[2048];
+    // qemu defaults nsid to zero
+    uint32_t nsid = 0;
+    nvme_identify_ns_cmd(&nvme, data, nsid);
+    uint64_t lba = 0;
+    uint32_t num_blocks = 1;
+    nvme_read_cmd(&nvme, nsid, data, lba, num_blocks);
+    nvme_write_cmd(&nvme, nsid, data, lba, num_blocks);
     return 0;
 }
 
