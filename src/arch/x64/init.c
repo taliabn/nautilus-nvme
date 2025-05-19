@@ -131,6 +131,9 @@
 #ifdef NAUT_CONFIG_ATA
 #include <dev/ata.h>
 #endif
+#ifdef NAUT_CONFIG_NVME
+#include <dev/nvme.h>
+#endif
 #ifdef NAUT_CONFIG_EXT2_FILESYSTEM_DRIVER
 #include <fs/ext2/ext2.h>
 #endif
@@ -544,6 +547,10 @@ threaded_init(void) {
 
 #ifdef NAUT_CONFIG_ATA
     nk_ata_init(naut);
+#endif
+
+#ifdef NAUT_CONFIG_NVME
+    nk_nvme_init(naut);
 #endif
 
 #ifdef NAUT_CONFIG_VIRTIO_PCI

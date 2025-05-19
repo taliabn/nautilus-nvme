@@ -34,7 +34,34 @@
 int  nk_nvme_init(struct naut_info *naut);
 void nk_nvme_deinit();
 
-/* NVMe types*/
+/* NVMe Macros */
+// PCI Config
+#define NVME_VENDOR_ID 0x1b36
+#define NVME_DEVICE_ID 0x0010
+#define NVME_BAR0 0xfebb0000
+#define NVME_PCI_CMD_OFFSET         0x4    // Device Control - RW
+#define NVME_PCI_STATUS_OFFSET      0x6    // Device Status - RO
+// PCI command register
+#define NVME_PCI_CMD_IO_ACCESS_EN   1       // io access enable
+#define NVME_PCI_CMD_MEM_ACCESS_EN  (1<<1)  // memory access enable
+#define NVME_PCI_CMD_LANRW_EN       (1<<2)  // enable mastering lan r/w
+#define NVME_PCI_CMD_INT_DISABLE    (1<<10) // legacy interrupt disable when set
+// PCI status register
+#define NVME_PCI_STATUS_INT         (1<<3)
+// NVME controller registers
+#define NVME_CAP_OFFSET 0x0 // Capabilities
+#define NVME_VS_OFFSET 0x8 // Version
+#define NVME_CC_OFFSET 0x14 // Controller Configuration
+#define NVME_ASQ_OFFSET 0x28 // Admin Submission Queue Base Address
+#define NVME_ACQ_OFFSET 0x30 // Admin Completion Queue Base Address
+// NVME config values
+#define NVME_VERSION 0x00010400 // version 1.4
+#define NVME_MPS 4 // 4 bits wide
+#define NVME_PAGE_SIZE 1 << (12 + NVME_MPS) // should be between 0x1000 and 0x10000
+#define NVME_SQES 6 //  I/O Submission Queue Entry Size (specified as 2^n)
+#define NVME_CQES 4 //  I/O Completion Queue Entry Size (specified as 2^n)
+/* NVMe types */
+
 
 /* Submission queue entries */
 struct nvme_command {
@@ -56,7 +83,7 @@ struct nvme_command {
     uint32_t cdw13;		/* command-specific */
     uint32_t cdw14;		/* command-specific */
     uint32_t cdw15;		/* command-specific */
-};
+}; // size:  64 bytes = 2^6
 
 /* command opcodes*/
 enum nvme_opcode {
@@ -106,6 +133,6 @@ struct nvme_completion {
     uint16_t sq_id;		/* submission queue identifier */
     uint16_t cid;		/* command identifier */
     uint16_t status; 	/* did the command fail, and if so, why? */
-};
+}; // size: 16 bytes = 2^4
 
 #endif
