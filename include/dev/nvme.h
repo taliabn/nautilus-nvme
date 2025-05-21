@@ -52,6 +52,8 @@ void nk_nvme_deinit();
 #define NVME_CAP_OFFSET 0x0 // Capabilities
 #define NVME_VS_OFFSET 0x8 // Version
 #define NVME_CC_OFFSET 0x14 // Controller Configuration
+#define NVME_CSTS_OFFSET 0x1c // Controller Status
+#define NVME_AQA_OFFSET 0x24 // Admin Queue Attributesf
 #define NVME_ASQ_OFFSET 0x28 // Admin Submission Queue Base Address
 #define NVME_ACQ_OFFSET 0x30 // Admin Completion Queue Base Address
 // NVME config values
@@ -60,6 +62,11 @@ void nk_nvme_deinit();
 #define NVME_PAGE_SIZE 1 << (12 + NVME_MPS) // should be between 0x1000 and 0x10000
 #define NVME_SQES 6 //  I/O Submission Queue Entry Size (specified as 2^n)
 #define NVME_CQES 4 //  I/O Completion Queue Entry Size (specified as 2^n)
+// Admin queue sizes are 0's based and units are number of entries
+// Min number of entries is 2 and max number of entries is 4096
+#define NVME_ACQS 63 // Admin Completion Queue Size 
+#define NVME_ASQS 63 // Admin Submission Queue Size
+
 /* NVMe types */
 
 
@@ -134,5 +141,14 @@ struct nvme_completion {
     uint16_t cid;		/* command identifier */
     uint16_t status; 	/* did the command fail, and if so, why? */
 }; // size: 16 bytes = 2^4
+
+/* namespace */
+// can add or remove fields if need be
+struct nvme_namespace {
+    uint32_t nsid;
+    uint64_t nsze; // total size of namespace in logical blocks
+    uint64_t ncap; // total number of logical blocks that can be allocated at once
+    uint8_t lbads; // lba data size (2^n)
+};
 
 #endif

@@ -49,6 +49,7 @@
 
 #define READ_MEM64(d, o)       (*((volatile uint64_t*)((d)->mem_start + (o))))
 #define WRITE_MEM64(d, o, v)     ((*((volatile uint64_t*)(((d)->mem_start)+(o))))=(v))
+
 /* Work in progress NVMe driver*/
 
 // types
@@ -73,7 +74,7 @@ struct nvme_dev {
     char* pci_addr;
     uint8_t* addr;
     int len;
-    uint16_t dstrd;
+    uint32_t dstrd;
     nvme_sq admin_sq;
     nvme_cq admin_cq;
     nvme_sq io_sq; // For now 1
@@ -81,6 +82,9 @@ struct nvme_dev {
     uint8_t buffer; // Suggets 2 MiB buffer, but probably unnecesary since Nautilus doesn't page
     uint64_t prp_list[512];
     uint32_t* namespaces; // For now empty, can implement as linked list
+    // ^^ probably want to use the pre-existing nautilus linked list implementation
+    // for now let's have a struct with a single namespace
+    struct nvme_namespace *ns;
     // stats?
     uint16_t q_id;
     // Where registers are mapped into the physical memory address space
@@ -99,15 +103,38 @@ int nvme_create_io_cq_cmd(struct nvme_dev *nvme, uint16_t cq_id, nvme_cq *io_cq)
 void nvme_write_reg(uint32_t offset, uint32_t value){}; // TODO: actually write this
 static int nvme_pci_init(struct nvme_dev *state);
 
+// helper functions
+static inline volatile uint32_t read_arr_32le(const uint8_t * d, uint16_t o){
+    uint32_t ret = 0;
+    for (int i=0; i<4; i++){
+        ret |= ((uint32_t)d[o+i]) << (8*i);
+    }
+    return ret;
+}; 
+
+static inline volatile uint64_t read_arr_64le(const uint8_t * d, uint16_t o){
+    uint64_t ret = 0;
+    for (int i=0; i<8; i++){
+        ret |= ((uint64_t)d[o+i]) << (8*i);
+    }
+    return ret;
+}; 
+
+// Queues
+
 // Currently very based on OSDev, should modify to be more Nautilus
 int create_admin_submission_queue(struct nvme_dev *nvme) {
 	nvme->admin_sq.addr = (uint64_t)malloc(PAGE_SIZE); // IDK if this is still valid without paging
 	if (nvme->admin_sq.addr == 0) {
 		return 1;
     }
-	nvme->admin_sq.size = 63;
+	nvme->admin_sq.size = NVME_ASQS;
     // Bottom 12 bits of address must be 0. Luckily, nautilus malloc guarantees this
 	WRITE_MEM(nvme, NVME_ASQ_OFFSET, nvme->admin_sq.addr);
+    // write admin submission queue size to Admin Queue Attributes (AQA) register
+    uint32_t aqa = READ_MEM(nvme, NVME_AQA_OFFSET);
+    aqa |= NVME_ASQS;
+    WRITE_MEM(nvme, NVME_AQA_OFFSET, aqa);
 	return 0;
 }
 
@@ -116,9 +143,13 @@ int create_admin_completion_queue(struct nvme_dev *nvme) {
 	if (nvme->admin_cq.addr == 0) {
 		return 1;
     }
-	nvme->admin_cq.size = 63;
+	nvme->admin_cq.size = NVME_ACQS;
     // Bottom 12 bits of address must be 0. Luckily, nautilus malloc guarantees this
 	WRITE_MEM(nvme, NVME_ACQ_OFFSET,nvme->admin_cq.addr);
+    // write admin completion queue size to Admin Queue Attributes (AQA) register
+    uint32_t aqa = READ_MEM(nvme, NVME_AQA_OFFSET);
+    aqa |= NVME_ACQS << 16;
+    WRITE_MEM(nvme, NVME_AQA_OFFSET, aqa);
 	return 0;
 }
 
@@ -212,6 +243,7 @@ int nvme_identify_controller_cmd(struct nvme_dev *nvme, void *buff){
     return nvme_identify_controller_or_ns_list_cmd(nvme, CONTROLLER, buff);
 }
 
+// A list of 1,024 namespace IDs is returned to the host containing active NSIDs in increasing order 
 int nvme_identify_ns_list_cmd(struct nvme_dev *nvme, void *buff){
     return nvme_identify_controller_or_ns_list_cmd(nvme, NAMESPACE_LIST, buff);
 }
@@ -306,8 +338,7 @@ int nk_nvme_init(struct naut_info *naut)
         return -1;
     }
 
-    INIT_LIST_HEAD(&dev_list);
-
+    INIT_LIST_HEAD(&dev_list);    
     DEBUG("Finding NVMe devices\n");
 
     list_for_each(curbus,&(pci->bus_list)) {
@@ -327,12 +358,11 @@ int nk_nvme_init(struct naut_info *naut)
             DEBUG("Found NVMe Device\n");
 
             struct nvme_dev *state = (struct nvme_dev *)malloc(sizeof(struct nvme_dev));
-            memset(state, 0, sizeof(struct nvme_dev));
             if (!state) {
                 ERROR("Cannot allocate NVMe device state\n");
                 return -1;
             }
-            memset(state,0,sizeof(*state));
+            memset(state, 0, sizeof(*state));
         
             // We will *not* support interrupts for now
     
@@ -381,7 +411,7 @@ int nk_nvme_init(struct naut_info *naut)
             // we have a 64-bit address but bar1 is all zeros
             state->mem_start = bar & 0xfffffff0;
             state->mem_end = state->mem_start + size;
-            foundmem=1;
+            foundmem = 1;
     
             INFO("Adding nvme device: bus=%u dev=%u func=%u: mem_start=%p mem_end=%p\n",
                  bus->num, pdev->num, 0,
@@ -429,24 +459,24 @@ int nk_nvme_init(struct naut_info *naut)
             ERROR("Unsupported nvme page size. min=0x%08x; max=0x%08x; actual=0x%08x\n", mpsmin, mpsmax, NVME_PAGE_SIZE);
             return -1;
         }
+        state->dstrd = 1 << (2 + ((cap>>32) & 0xf));
 
         // This is a supported NVMe device
         state->pci_dev = pdev;
-        // Register block device (mostly copied from ata.c)
-        uint16_t num = 0;
-        char blkdev_name[32];
-        sprintf(blkdev_name,"nvme-%d", num);
-        state->blkdev = nk_block_dev_register(blkdev_name, 0, &inter, state);
-        if (!state->blkdev) {
-            ERROR("Failed to register %s\n",blkdev_name);
-        }
-        INFO("Added nvme device %s, type %s, blocksize=%lu, numblocks=%lu\n",
-            blkdev_name,
-            state->type==HD ? "HD" : state->type==CD ? "CD" : "UNKNOWN", 
-            state->block_size,state->num_blocks );
-        num++;
 
         // NVME specific setup
+
+        // Reset the controller 
+        // triggered by a falling edge on the Enable bit of the controller configuration register
+        WRITE_MEM(state, NVME_CC_OFFSET, 1);
+        io_delay();
+        WRITE_MEM(state, NVME_CC_OFFSET, 0);
+
+        // Wait for controller to indicate reset is complete (bit 0 of CSCT.RDY == 0)
+        while (READ_MEM(state, NVME_CSTS_OFFSET) & 0x1){
+            io_delay();
+        }
+
         // Create admin queues
         if (create_admin_submission_queue(state) ||
             create_admin_completion_queue(state)) 
@@ -454,28 +484,26 @@ int nk_nvme_init(struct naut_info *naut)
             ERROR("Failure to create admin queues\n");
             return 1;
         }
-        // Reset the controller 
-        // triggered by a falling edge on the Enable bit of the controller configuration register
-        WRITE_MEM(state, NVME_CC_OFFSET, 1);
-        WRITE_MEM(state, NVME_CC_OFFSET, 0);
 
         // Set the controller configuration
         uint32_t cc = READ_MEM(state, NVME_CC_OFFSET);
         // We'll leave arbitration mechanism (AMS) as default (round robin)
-        // command set selected (CSS) should support I/O by defauly
+        // command set selected (CSS) should support I/O by default
         // Set max page size (MPS)
         cc |= NVME_MPS << 7; // memory page size is (2 ^ (12 + MPS))
 
         // Start the controller by setting the enable bit
         cc |= 1;
         WRITE_MEM(state, NVME_CC_OFFSET, cc);
+        // Wait for controller to indicate it's ready to accept commands (bit 0 of CSCT.RDY == 1)
+        while (!(READ_MEM(state, NVME_CSTS_OFFSET) & 0x1)){
+            io_delay();
+        }
 
         // If we want interrupts, enable them and register a handler (skipping for now)
 
         // Send the identify command to the controller. 
-        uint8_t id_data[4096];
-        // qemu defaults nsid to zero
-        uint32_t nsid = 0;
+        uint8_t id_data[4096]; // data structure returned by identify is 4096 bytes
         if (nvme_identify_controller_cmd(state, id_data)){
             ERROR("Identify controller command failed\n");
             return -1;
@@ -500,7 +528,7 @@ int nk_nvme_init(struct naut_info *naut)
             ERROR("Unsupported nvme submission queue entry size. min=0x%08x; max=0x%08x; actual=0x%08x\n",  min_sqes, max_sqes, NVME_SQES);
             // return -1;
         }
-        uint8_t cqes = id_data[4096];
+        uint8_t cqes = id_data[513];
         uint16_t min_cqes = 1 << (cqes & 0xf);
         uint16_t max_cqes = 1 << (cqes >> 4); // should be 4
         DEBUG("completion queue entry size min=0x%08x; max=0x%08x; actual=0x%08x\n", min_cqes, max_cqes, NVME_CQES);
@@ -521,15 +549,65 @@ int nk_nvme_init(struct naut_info *naut)
             ERROR("Failure to create admin queues\n");
             // return -1;
         }
-        // Identify active namespace IDs, and then identify individual namespaces. Record their block size, capacity and whether they are read-only.
-        // TODO: multiple namespaces. for now just check what's up with nsid=0
-        // also might want to save state for each namespace
+        // Do stuff with MSI here if we enable interrupts
+        // Identify active namespace IDs, and then identify individual namespaces. 
         memset(id_data, 0, sizeof(id_data));
-        if (nvme_identify_namespace_cmd(state, id_data, 0)){
+        if (nvme_identify_ns_list_cmd(state, id_data)){
             ERROR("Identify namespace command failed\n");
             return -1;
         }
+        // we could loop over this list of nsid's until we find a zero id (which indicates no more namespaces)
+        // however, qemu must be configured to add additional namespaces
+        // qemu defaults to a single namespace with nsid=1
+        // for now, let's just store info about the first one, but for good measure still send the identify namespace list command and get the nsid that way
+        uint32_t nsid0 = (id_data[2] << 16) | (id_data[1] << 8) | id_data[0];
+        DEBUG("Identify Namespace List returned nsid0=0x%06x\n", nsid0);
+        if (!nsid0){
+            ERROR("Namespace ID list is empty\n");
+            // return -1;
+        }
+
+        memset(id_data, 0, sizeof(id_data));
+        if (nvme_identify_ns_cmd(state, id_data, nsid0)){
+            ERROR("Identify namespace command failed\n");
+            return -1;
+        }    
         
+        // Record namespace block size and capacity
+        struct nvme_namespace *ns0 = (struct nvme_namespace *)malloc(sizeof(struct nvme_namespace));
+        if (!ns0) {
+            ERROR("Cannot allocate NVMe namespace\n");
+            return -1;
+        }
+        memset(ns0, 0, sizeof(*ns0));
+        state->ns = ns0;
+        ns0->nsid = nsid0; // this should be one (for qemu's first ns)
+        ns0->nsze = read_arr_64le(id_data, 0); // num_blocks
+        state->num_blocks = ns0->nsze; // TODO: are num_blocks and block_size mandatory for block device state?
+        ns0->ncap = read_arr_64le(id_data, 8);
+        DEBUG("Namespace nsid=%u, nsze=%lu, ncap=%lu\n", ns0->nsid, ns0->nsze, ns0->ncap);
+        // TODO: state->block_size is 64 bits. Ours might not fit? check
+        // LBA format. It's possible to have multiple, let's only care about the first one for now
+        uint8_t lba_format_idx = id_data[26] & 0xf;
+        uint32_t lba_format = read_arr_32le(id_data, 128 + lba_format_idx);
+        // qemu defaults to 0 metadata bytes per LBA and no extended LBA. let's keep it that way for now
+        ns0->lbads = (lba_format>>16) & 0xf;
+        // actual lba data size = (2^lbads);
+        state->block_size = 1 << (ns0->lbads);
+        DEBUG("LBA Format Index=%u, lba_format=0x%08x, lbads=%u, block_size=%lu\n",
+            lba_format_idx, lba_format, ns0->lbads, state->block_size);
+        // now that we have block size and number of blocks, register block device (mostly copied from ata.c)
+        char blkdev_name[32];
+        sprintf(blkdev_name,"nvme-%d", num);
+        state->blkdev = nk_block_dev_register(blkdev_name, 0, &inter, state);
+        if (!state->blkdev) {
+            ERROR("Failed to register %s\n",blkdev_name);
+        }
+        INFO("Added nvme device %s, type %s, blocksize=%lu, numblocks=%lu\n",
+            blkdev_name,
+            state->type==HD ? "HD" : state->type==CD ? "CD" : "UNKNOWN", 
+            state->block_size,state->num_blocks );
+        num++;
         INFO("%s potentially operational\n",state->dev->name);
         }
         }
