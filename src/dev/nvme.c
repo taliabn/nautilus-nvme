@@ -34,6 +34,8 @@
 #include <nautilus/shell.h>
 #include <nautilus/dev.h>
 #include <nautilus/endian.h>
+#include <nautilus/semaphore.h>
+#include <nautilus/spinlock.h> // could use mutex instead, doesn't really matter
 
 #ifndef NAUT_CONFIG_DEBUG_NVME
 #undef DEBUG_PRINT
@@ -61,6 +63,59 @@ struct nvme_queue {
 typedef struct nvme_queue nvme_sq;
 
 typedef struct nvme_queue nvme_cq;
+
+struct wrapped_queue {
+    struct nk_semaphore *slots;
+    struct nk_spinlock *lock;
+    struct nvme_queue *actual_queue;
+    struct nvme_command buffer[64]; // I think this is the number?
+    int write_index;
+    int read_index;
+};
+
+struct wrapped_queue* create_wrapped_queue(struct nvme_queue* nq) {
+    struct wrapped_queue *q = malloc(sizeof(struct wrapped_queue));
+    q->slots = nk_semaphore_create(0, 64, 0, 0);
+    spinlock_init(q->lock);
+    q->actual_queue = nq;
+    q->write_index = 0;
+    q->read_index = 0;
+}
+
+create_wrapped_queue(struct wrapped_queue* q) {
+    struct wrapped_queue *q = malloc(sizeof(struct wrapped_queue));
+    nk_semaphore_release(q->slots);
+    free(q);
+}
+
+int enqueue(struct wrapped_queue *q, struct nvme_command entry) {
+    nk_semaphore_down(q->slots);
+    spin_lock(q->lock);
+    if ((q->write_index + 1) % 64 == q->read_index) {
+        // handle full buffer in caller
+        // should be impossible because semaphore?
+        return -1;
+    }
+    q->buffer[q->write_index] = entry;
+    q->write_index = (q->write_index + 1) % 64;
+    spin_unlock(q->lock);
+    nk_semaphore_up(q->slots);
+    return 0;
+}
+
+int dequeue(struct wrapped_queue *q, struct nvme_command *value) {
+    spin_lock(q->lock);
+    if (q->write_index == q->read_index) {
+        // handle empty buffer in caller
+        // should be impossible because semaphore?
+        return -1;
+    }
+    *value = q->buffer[q->read_index];
+    q->read_index = (q->read_index + 1) % 64;
+    spin_unlock(q->lock);
+    nk_semaphore_up(q->slots);
+    return 0;
+}
 
 struct nvme_dev {
 
