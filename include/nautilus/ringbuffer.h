@@ -24,8 +24,8 @@
 
 #include <nautilus/semaphore.h>
 #include <nautilus/spinlock.h> // could use mutex instead, doesn't really matter
-#include <stdlib.h>
-#include <string.h> // for memcpy
+#include <nautilus/nautilus.h>
+#include <naut_string.h> // for memcpy
 
 struct ring_buffer {
     struct nk_semaphore *slots_free_write;
