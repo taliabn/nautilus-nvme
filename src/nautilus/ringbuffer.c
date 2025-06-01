@@ -24,46 +24,59 @@
 
 #include <nautilus/ringbuffer.h>
 
-struct ring_buffer* create_ring_buffer(int capacity) {
-    struct ring_buffer *q = malloc(sizeof(struct ring_buffer) + ((capacity - 1) * sizeof(struct nvme_command)));
-    q->slots = nk_semaphore_create(0, capacity, 0, 0);
+struct ring_buffer* create_ring_buffer(int capacity, int struct_size) {
+    struct ring_buffer *q = malloc(sizeof(struct ring_buffer) + ((capacity - 1) * struct_size));
+    q->slots_free_read = nk_semaphore_create(0, capacity, 0, 0);
+    q->slots_free_write = nk_semaphore_create(0, 0, 0, 0);
     spinlock_init(&q->lock);
+    q->struct_size = struct_size;
     q->capacity = capacity;
     q->write_index = 0;
     q->read_index = 0;
+    q->buffer = &q->buffer; // Ugly af, but should work.
     return q;
 }
 
-delete_ring_buffer(struct ring_buffer* q) {
-    nk_semaphore_release(q->slots);
+void array_read(struct ring_buffer* q, int index, void* entry) {
+    memcpy(entry, q->buffer + index * q->struct_size, q->struct_size);
+}
+
+void array_write(struct ring_buffer* q, int index, void* entry) {
+    memcpy(q->buffer + index * q->struct_size, entry, q->struct_size);
+}
+
+void delete_ring_buffer(struct ring_buffer* q) {
+    nk_semaphore_release(q->slots_free_read);
+    nk_semaphore_release(q->slots_free_write);
     free(q);
 }
 
-int ring_enqueue(struct ring_buffer *q, struct nvme_command entry) {
-    nk_semaphore_down(q->slots);
+int ring_enqueue(struct ring_buffer *q, void* entry) {
+    nk_semaphore_down(q->slots_free_read);
     spin_lock(&q->lock);
     if ((q->write_index + 1) % q->capacity == q->read_index) {
         // handle full buffer in caller
         // should be impossible because semaphore?
         return -1;
     }
-    q->buffer[q->write_index] = entry;
+    array_write(q, q->write_index, entry);
     q->write_index = (q->write_index + 1) % q->capacity;
     spin_unlock(&q->lock);
-    nk_semaphore_up(q->slots);
+    nk_semaphore_up(q->slots_free_write);
     return 0;
 }
 
-int ring_dequeue(struct ring_buffer *q, struct nvme_command *value) {
+int ring_dequeue(struct ring_buffer *q, void* value) {
+    nk_semaphore_down(q->slots_free_write);
     spin_lock(&q->lock);
     if (q->write_index == q->read_index) {
         // handle empty buffer in caller
         // should be impossible because semaphore?
         return -1;
     }
-    *value = q->buffer[q->read_index];
+    array_read(q, q->read_index, value);
     q->read_index = (q->read_index + 1) % q->capacity;
     spin_unlock(&q->lock);
-    nk_semaphore_up(q->slots);
+    nk_semaphore_up(q->slots_free_read);
     return 0;
 }
