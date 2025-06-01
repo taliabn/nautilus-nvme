@@ -57,6 +57,7 @@
 struct nvme_queue {
     uint64_t addr;
     uint64_t size;
+    uint16_t id;
 };
 
 typedef struct nvme_queue nvme_sq;
@@ -131,6 +132,7 @@ int create_admin_submission_queue(struct nvme_dev *nvme) {
 		return 1;
     }
 	nvme->admin_sq.size = NVME_ASQS;
+    nvme->admin_sq.id = 0; // admin queues will arbitrarily have id=0
     // Bottom 12 bits of address must be 0. Luckily, nautilus malloc guarantees this
 	WRITE_MEM(nvme, NVME_ASQ_OFFSET, nvme->admin_sq.addr);
     // write admin submission queue size to Admin Queue Attributes (AQA) register
@@ -146,6 +148,7 @@ int create_admin_completion_queue(struct nvme_dev *nvme) {
 		return 1;
     }
 	nvme->admin_cq.size = NVME_ACQS;
+    nvme->admin_cq.id = 0; // admin queues will arbitrarily have id=0
     // Bottom 12 bits of address must be 0. Luckily, nautilus malloc guarantees this
 	WRITE_MEM(nvme, NVME_ACQ_OFFSET,nvme->admin_cq.addr);
     // write admin completion queue size to Admin Queue Attributes (AQA) register
@@ -161,9 +164,10 @@ int create_io_submission_queue(struct nvme_dev *nvme, nvme_sq *sq) {
 		return 1;
     }
 	sq->size = 63;
-    // since we only have one io queue pair, just set id=0
-    uint16_t sq_id = 0;
-    uint16_t cq_id = 0;
+    // io queues will arbitrarily have id=1
+    uint16_t sq_id = 1;
+    uint16_t cq_id = 1;
+    sq->id = sq_id;
 	return nvme_create_io_sq_cmd(nvme, sq_id, cq_id, sq);
 }
 
@@ -173,35 +177,47 @@ int create_io_completion_queue(struct nvme_dev *nvme, nvme_cq *cq) {
 		return 1;
     }
 	cq->size = 63;
-    // since we only have one io queue pair, just set id=0
-    uint16_t cq_id = 0;
+    // io queues will arbitrarily have id=1
+    uint16_t cq_id = 1;
+    cq->id = cq_id;
 	return nvme_create_io_cq_cmd(nvme, cq_id, cq);
 }
 
 
 /* Command submisison helper functions */
 
-static int nvme_queue_submit_cmd(struct nvme_queue *queue, struct nvme_command *cmd){
+static int nvme_queue_submit_cmd(struct nvme_dev *nvme, struct nvme_queue *sq, struct nvme_queue *cq, struct nvme_command *cmd, struct nvme_completion comp){
+    // enque cmd in ring buffer
+    if (enqueue(sq, cmd)){
+        ERROR("unable to enqueue command in ringbuff\n");
+        return -1;
+    };
+    // ring sq doorbell
+    uint16_t sq_tail_doorbell = 0x1000 + 2*sq->id * (4 << nvme->dstrd);
+    WRITE_MEM(nvme, sq_tail_doorbell, sq.tail);
     DEBUG("command successfully submitted!\n");
-    // TODO replace with actual function...
-    // should also probably do something with the completion
+    // somehow we have to move the submission ringbuffer's tail
+    // poll: TODO
+    ring_dequeue(cq, comp);
+    uint16_t cq_head_doorbell = 0x1000 + 2*(sq->id + 1) * (4 << nvme->dstrd);
+
     return 0;
 }
 
-static int nvme_submit_admin_cmd(struct nvme_dev *nvme, struct nvme_command *cmd)
+static int nvme_submit_admin_cmd(struct nvme_dev *nvme, struct nvme_command *cmd, struct nvme_completion *comp)
 {
-    return nvme_queue_submit_cmd(&(nvme->admin_sq), cmd);
+    return nvme_queue_submit_cmd(struct nvme_dev *nvme, &(nvme->admin_sq), &(nvme->admin_cq), cmd, comp);
 }
 
-static int nvme_submit_io_cmd(struct nvme_dev *nvme, struct nvme_command *cmd)
+static int nvme_submit_io_cmd(struct nvme_dev *nvme, struct nvme_command *cmd, struct nvme_completion *comp)
 {
-    return nvme_queue_submit_cmd(&(nvme->io_sq), cmd);
+    return nvme_queue_submit_cmd(struct nvme_dev *nvme, &(nvme->io_sq), &(nvme->io_sq), cmd, comp);
 }
 
 /* IO Commands */
 
 static int nvme_rw_cmd(struct nvme_dev *nvme, uint8_t opc, uint32_t nsid, 
-                void *buff, uint64_t lba, uint32_t num_blocks)
+                void *buff, uint64_t lba, uint32_t num_blocks, struct nvme_completion *comp)
 {
     struct nvme_command cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -213,24 +229,24 @@ static int nvme_rw_cmd(struct nvme_dev *nvme, uint8_t opc, uint32_t nsid,
 	cmd.cdw11 = htole32(lba >> 32);
 	cmd.cdw12 = htole32(num_blocks-1);
 
-    return nvme_submit_io_cmd(nvme, &cmd);
+    return nvme_submit_io_cmd(nvme, &cmd, comp);
 }
 
 int nvme_write_cmd(struct nvme_dev *nvme, uint32_t nsid, void *buff,
-    uint64_t lba, uint32_t num_blocks)
+    uint64_t lba, uint32_t num_blocks, struct nvme_completion *comp)
 {
-	return nvme_rw_cmd(nvme, NVME_OPC_WRITE, nsid, buff, lba, num_blocks);
+	return nvme_rw_cmd(nvme, NVME_OPC_WRITE, nsid, buff, lba, num_blocks, comp);
 }
 
 int nvme_read_cmd(struct nvme_dev *nvme, uint32_t nsid, void *buff, 
-    uint64_t lba, uint32_t num_blocks)
+    uint64_t lba, uint32_t num_blocks, struct nvme_completion *comp)
 {
-	return nvme_rw_cmd(nvme, NVME_OPC_READ, nsid, buff, lba, num_blocks);
+	return nvme_rw_cmd(nvme, NVME_OPC_READ, nsid, buff, lba, num_blocks, comp);
 }
 
 /* Admin Commands */
 
-int nvme_identify_controller_or_ns_list_cmd(struct nvme_dev *nvme, uint16_t subsys, void *buff){
+int nvme_identify_controller_or_ns_list_cmd(struct nvme_dev *nvme, uint16_t subsys, void *buff, struct nvme_completion *comp){
     struct nvme_command cmd;
     memset(&cmd, 0, sizeof(cmd));
 
@@ -238,19 +254,19 @@ int nvme_identify_controller_or_ns_list_cmd(struct nvme_dev *nvme, uint16_t subs
 	cmd.prp1 = (uintptr_t)buff; // command output (a single page)
     cmd.cdw10 = htole32(subsys);
 
-    return nvme_submit_admin_cmd(nvme, &cmd);
+    return nvme_submit_admin_cmd(nvme, &cmd, comp);
 }
 
-int nvme_identify_controller_cmd(struct nvme_dev *nvme, void *buff){
-    return nvme_identify_controller_or_ns_list_cmd(nvme, CONTROLLER, buff);
+int nvme_identify_controller_cmd(struct nvme_dev *nvme, void *buff, struct nvme_completion *comp){
+    return nvme_identify_controller_or_ns_list_cmd(nvme, CONTROLLER, buff, comp);
 }
 
 // A list of 1,024 namespace IDs is returned to the host containing active NSIDs in increasing order 
-int nvme_identify_ns_list_cmd(struct nvme_dev *nvme, void *buff){
-    return nvme_identify_controller_or_ns_list_cmd(nvme, NAMESPACE_LIST, buff);
+int nvme_identify_ns_list_cmd(struct nvme_dev *nvme, void *buff, struct nvme_completion *comp){
+    return nvme_identify_controller_or_ns_list_cmd(nvme, NAMESPACE_LIST, buff, comp);
 }
 
-int nvme_identify_ns_cmd(struct nvme_dev *nvme, void *buff, uint32_t nsid){
+int nvme_identify_ns_cmd(struct nvme_dev *nvme, void *buff, uint32_t nsid, struct nvme_completion *comp){
     struct nvme_command cmd;
     memset(&cmd, 0, sizeof(cmd));
 
@@ -259,10 +275,10 @@ int nvme_identify_ns_cmd(struct nvme_dev *nvme, void *buff, uint32_t nsid){
 	cmd.prp1 = (uintptr_t)buff; // command output (a single page)
     cmd.cdw10 = htole32(NAMESPACE);
 
-    return nvme_submit_admin_cmd(nvme, &cmd);
+    return nvme_submit_admin_cmd(nvme, &cmd, comp);
 }
 
-int nvme_create_io_sq_cmd(struct nvme_dev *nvme, uint16_t sq_id, uint16_t cq_id, nvme_sq *io_sq){
+int nvme_create_io_sq_cmd(struct nvme_dev *nvme, uint16_t sq_id, uint16_t cq_id, nvme_sq *io_sq, struct nvme_completion *comp){
     struct nvme_command cmd;
     memset(&cmd, 0, sizeof(cmd));
 
@@ -271,10 +287,10 @@ int nvme_create_io_sq_cmd(struct nvme_dev *nvme, uint16_t sq_id, uint16_t cq_id,
 	cmd.cdw10 = htole32(((io_sq->size-1) << 16) | sq_id);
 	cmd.cdw11 = htole32((cq_id << 16) | 0x01);
     
-    return nvme_submit_admin_cmd(nvme, &cmd); 
+    return nvme_submit_admin_cmd(nvme, &cmd, comp); 
 }
 
-int nvme_create_io_cq_cmd(struct nvme_dev *nvme, uint16_t cq_id, nvme_cq *io_cq){
+int nvme_create_io_cq_cmd(struct nvme_dev *nvme, uint16_t cq_id, nvme_cq *io_cq, ){
     struct nvme_command cmd;
     memset(&cmd, 0, sizeof(cmd));
 
