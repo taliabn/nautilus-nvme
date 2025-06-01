@@ -23,6 +23,7 @@
 #ifndef __SEMAPHORE_H__
 #define __SEMAPHORE_H__
 
+#include <stdint.h> 
 
 // Semaphores are intended for threads
 // Interrupts should only use try_up and try_down

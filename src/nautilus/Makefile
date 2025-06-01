@@ -53,7 +53,8 @@ obj-y += \
 	iomap.o \
 	topo.o \
 	argp.o \
-	xcall.o
+	xcall.o \
+	ringbuffer.o
 
 obj-$(NAUT_CONFIG_ARCH_X86) += \
 	mb_utils.o \
