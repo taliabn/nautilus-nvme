@@ -24,23 +24,26 @@
 
 #include <nautilus/semaphore.h>
 #include <nautilus/spinlock.h> // could use mutex instead, doesn't really matter
+#include <stdlib.h>
+#include <string.h> // for memcpy
 
 struct ring_buffer {
-    struct nk_semaphore *slots; // Possibly need to make one for filled slots one for empty. IDK why, but other code examples do it.
-    struct nk_spinlock lock;
+    struct nk_semaphore *slots_free_write;
+    struct nk_semaphore *slots_free_read;
+    spinlock_t lock;
     int capacity;
     int write_index;
     int read_index;
-    // TODO: Change so that the array can be any data type.
-    struct nvme_command buffer[]; // I think this is correct?
+    int struct_size;
+    void* buffer; // I think this is correct?
 };
 
-struct ring_buffer* create_ring_buffer(int capacity);
+struct ring_buffer* create_ring_buffer(int capacity, int struct_size);
 
 void delete_ring_buffer(struct ring_buffer* q);
 
-int ring_enqueue(struct ring_buffer *q, struct nvme_command entry);
+int ring_enqueue(struct ring_buffer *q, void* entry);
 
-int ring_dequeue(struct ring_buffer *q, struct nvme_command *value);
+int ring_dequeue(struct ring_buffer *q, void* value);
 
 // TODO: Add try_enqueue() and try_dequeue() to match Nautilus conventions
