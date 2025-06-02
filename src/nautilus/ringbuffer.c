@@ -25,7 +25,21 @@
 #include <nautilus/ringbuffer.h>
 
 struct ring_buffer* create_ring_buffer(int capacity, int struct_size) {
-    struct ring_buffer *q = malloc(sizeof(struct ring_buffer) + ((capacity - 1) * struct_size));
+    // Allocate memory for the ring buffer structure
+    struct ring_buffer *q = malloc(sizeof(struct ring_buffer));
+    if (!q) {
+        return NULL; // Allocation failed
+    }
+
+    // Allocate memory for the buffer separately
+    // TODO: ensure 12-bit alignment properly
+    // q->buffer = malloc(capacity * struct_size);
+    q->buffer = malloc(PAGE_SIZE);
+    if (!q->buffer) {
+        free(q); // Free the ring buffer structure if buffer allocation fails
+        return NULL;
+    }
+
     q->slots_free_read = nk_semaphore_create(0, capacity, 0, 0);
     q->slots_free_write = nk_semaphore_create(0, 0, 0, 0);
     spinlock_init(&q->lock);
@@ -33,7 +47,6 @@ struct ring_buffer* create_ring_buffer(int capacity, int struct_size) {
     q->capacity = capacity;
     q->write_index = 0;
     q->read_index = 0;
-    q->buffer = &q->buffer; // Ugly af, but should work.
     return q;
 }
 

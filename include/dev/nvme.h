@@ -139,8 +139,9 @@ struct nvme_completion {
     uint16_t sq_head;	/* submission queue head pointer */
     uint16_t sq_id;		/* submission queue identifier */
     uint16_t cid;		/* command identifier */
-    uint16_t status; 	/* did the command fail, and if so, why? */
-}; // size: 16 bytes = 2^4
+    uint16_t phase_tag:1; /* is this a new entry */
+    uint16_t status:15; 	/* did the command fail, and if so, why? */
+} __attribute__((packed)); // size: 16 bytes = 2^4
 
 /* namespace */
 // can add or remove fields if need be
