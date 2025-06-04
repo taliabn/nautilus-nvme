@@ -341,12 +341,10 @@ static int nvme_rw_cmd(struct nvme_dev *nvme, uint8_t opc, uint32_t nsid,
 	cmd.opc = opc;
 	cmd.nsid = htole32(nsid);
 	cmd.prp1 = (uintptr_t)buff;
+    // cmd.prp2 = (uintptr_t)(buff + NVME_PAGE_SIZE);
     cmd.cdw10 = htole32(lba & 0xffffffffu);
 	cmd.cdw11 = htole32(lba >> 32);
 	cmd.cdw12 = htole32(num_blocks-1);
-
-    DEBUG("Submitting rw command: opc=0x%x, nsid=0x%x, prp1=0x%lx, lba=0x%lx, num_blocks=0x%x\n",
-        cmd.opc, cmd.nsid, cmd.prp1, lba, num_blocks);
 
     return nvme_submit_io_cmd(nvme, &cmd, comp);
 }
@@ -611,6 +609,7 @@ int nk_nvme_init(struct naut_info *naut)
         // Memory page size max and min
         uint32_t mpsmin = 1 << (12 + ((cap>>48) & 0xf));
         uint32_t mpsmax = 1 << (12 + ((cap>>52) & 0xf));
+        DEBUG("mpsmin=0x%08x; mpsmax=0x%08x\n", (cap>>48) & 0xf, (cap>>52) & 0xf);
         if (NVME_PAGE_SIZE < mpsmin || NVME_PAGE_SIZE > mpsmax){
             ERROR("Unsupported nvme page size. min=0x%08x; max=0x%08x; actual=0x%08x\n", mpsmin, mpsmax, NVME_PAGE_SIZE);
             return -1;
@@ -655,6 +654,7 @@ int nk_nvme_init(struct naut_info *naut)
             // But that's irrelevant while we only have a single I/O submission queue
         // command set selected (CSS) should support I/O by default
         // Set max page size (MPS)
+        
         cc |= NVME_MPS << 7; // memory page size is (2 ^ (12 + MPS))
 
         // Start the controller by setting the enable bit
@@ -895,6 +895,49 @@ static int handle_nvmetest (char *buf, void *priv)
         }
     }
     DEBUG("PASSED WRITE + READ DATA TEST\n");
+
+    // test writing to multiple blocks at once
+    // TODO: add checks that not reading/writing beyond the end of the drive or >1 page (since rn only setting prp1)
+    lba = 0; // write to the next block
+    num_blocks = 16; // write multiple blocks
+    // generate and write some data
+    memset(data, 0, nvme->block_size*num_blocks);
+    status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
+    if (status){
+        ERROR("Write command failed! with code 0x%08x\n", status);
+        return -1;
+    };
+    status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
+    if (status){
+        ERROR("read command failed! with code 0x%08x\n", status);
+        return -1;
+    };
+    for (int i=0; i<nvme->block_size*num_blocks; i++){
+        if (data[i] != 0){
+            ERROR("data[%d] = 0x%02x, expected 0x%02x\n", i, data[i], 0);
+            return -1;
+        }
+    } 
+    for (int i=0; i<nvme->block_size*num_blocks; i++){
+        data[i] = (i + 1) % 256; // start from 1
+    }
+    status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
+    if (status){
+        ERROR("Write command failed! with code 0x%08x\n", status);
+        return -1;
+    };
+    status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
+    if (status){
+        ERROR("read command failed! with code 0x%08x\n", status);
+        return -1;
+    };
+    for (int i=0; i<nvme->block_size*num_blocks; i++){
+        if (data[i] != ((i + 1) % 256)){
+            ERROR("data[%d] = 0x%02x, expected 0x%02x\n", i, data[i], ((i + 1) % 256));
+            return -1;
+        }
+    }    
+    DEBUG("PASSED WRITE + READ MULTIPLE BLOCKS TEST\n");
     return 0;
 }
 

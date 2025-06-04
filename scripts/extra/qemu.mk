@@ -6,7 +6,7 @@ QEMU_FLAGS += -serial stdio
 #QEMU_FLAGS += -display none
 QEMU_FLAGS += -m 2G
 #QEMU_FLAGS += -device virtio-net-pci -nic socket,udp=1000,localaddr=localhost
-QEMU_FLAGS += -drive file=nvm.img,if=none,id=nvm
+QEMU_FLAGS += -drive file=nvm.img,if=none,id=nvm,format=raw
 QEMU_FLAGS += -device nvme,serial=deadbeef,drive=nvm
 
 qemu: $(QEMU_DEPS)
