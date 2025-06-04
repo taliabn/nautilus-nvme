@@ -96,6 +96,7 @@ struct nvme_dev {
     // Where registers are mapped into the physical memory address space
     uint64_t  mem_start;
     uint64_t  mem_end;
+    uint32_t mpsmin;
     uint8_t mdts; // max data transfer size (in units of the minimum memory page size and reported as a power of two )
 };
 
@@ -477,151 +478,43 @@ static struct nk_block_dev_int inter =
     .write_blocks = write_blocks,
 };
 
-// PCI initialization mostly copied from e1000e_pci_init
-int nk_nvme_init(struct naut_info *naut)
-{
-    struct pci_info *pci = nk_get_nautilus_info()->sys.pci;
-    struct list_head *curbus, *curdev;
-    uint16_t num = 0;
-    
-    INFO("init\n");
-    
-    if (!pci) {
-        ERROR("No PCI info\n");
+
+// Check PCI capabilities register for version, I/O command support, supported page size, and record dstrd
+int nvme_init_check_pci_cap(struct nvme_dev *state) {
+    // Check the controller version is supported.
+    volatile uint32_t version = READ_MEM(state, NVME_VS_OFFSET);
+    if (version != NVME_VERSION){
+        ERROR("Unsupported NVME version 0x%08x\n", version);
         return -1;
     }
+    DEBUG("Supported NVME version 0x%08x found\n", version);
 
-    struct nvme_dev *state = (struct nvme_dev *)malloc(sizeof(struct nvme_dev));
-    if (!state) {
-        ERROR("Cannot allocate NVMe device state\n");
+    volatile uint64_t cap = READ_MEM64(state, NVME_CAP_OFFSET);
+    // Check the capabilities register for support of the I/O NVMe command set.
+    if (!((cap >> 37) & 0x1)) {
+        ERROR("NVMe controller does not support I/O command set\n");
         return -1;
     }
-    memset(state, 0, sizeof(*state));
+    DEBUG("NVMe controller supports I/O\n");
 
-    INIT_LIST_HEAD(&dev_list);    
-    DEBUG("Finding NVMe devices\n");
+    // Check the capabilities register for support of the host's page size.
+    // Memory page size max and min
+    uint32_t mpsmin = 1 << (12 + ((cap>>48) & 0xf));
+    uint32_t mpsmax = 1 << (12 + ((cap>>52) & 0xf));
+    DEBUG("mpsmin=0x%08x; mpsmax=0x%08x\n", (cap>>48) & 0xf, (cap>>52) & 0xf);
+    if (NVME_PAGE_SIZE < mpsmin || NVME_PAGE_SIZE > mpsmax){
+        ERROR("Unsupported nvme page size. min=0x%08x; max=0x%08x; actual=0x%08x\n", mpsmin, mpsmax, NVME_PAGE_SIZE);
+        return -1;
+    }
+    DEBUG("Supported nvme page size. min=0x%08x; max=0x%08x; actual=0x%08x\n", mpsmin, mpsmax, NVME_PAGE_SIZE);
+    state->mpsmin = mpsmin; // need to save for use in max data transfer size calculation
+    state->dstrd = (cap>>32) & 0xf;
+    DEBUG("dstrd=0x%08x\n", state->dstrd);
+    return 0;
+}
 
-    list_for_each(curbus,&(pci->bus_list)) {
-        struct pci_bus *bus = list_entry(curbus,struct pci_bus,bus_node);
-    
-        DEBUG("Searching PCI bus %u for NVMe devices\n", bus->num);
-    
-        list_for_each(curdev, &(bus->dev_list)) {
-        struct pci_dev *pdev = list_entry(curdev,struct pci_dev,dev_node);
-        struct pci_cfg_space *cfg = &pdev->cfg;
-    
-        DEBUG("Device %u is a 0x%x:0x%x\n", pdev->num, cfg->vendor_id, cfg->device_id);
-        // intel vendor id and e1000e device id
-        if (cfg->vendor_id==NVME_VENDOR_ID && cfg->device_id==NVME_DEVICE_ID) {
-            int foundio=0, foundmem=0;
-        
-            DEBUG("Found NVMe Device\n");
-
-            // We will *not* support interrupts for now
-    
-            // find out the bar for NVMe
-            // only care about bar0
-            uint32_t bar = pci_cfg_readl(pci,bus->num, pdev->num, 0, 0x10);
-            uint32_t size;
-            DEBUG("bar 0: 0x%0x\n", bar);
-
-            // get the last bit and if it is zero, it is the memory
-            // " -------------------------"	one, it is the io
-            if (!(bar & 0x1)) {
-                uint8_t mem_bar_type = (bar & 0x6) >> 1;
-                if (mem_bar_type != 2) { 
-                    // 64 bit address that we do not handle it
-                    ERROR("Cannot handle memory bar type 0x%x\n", mem_bar_type);
-                    return -1;
-                }
-            }
-    
-            // determine size
-            // write all 1s, get back the size mask
-            pci_cfg_writel(pci, bus->num, pdev->num, 0, 0x10, 0xffffffff);
-            // size mask comes back + info bits
-            // write all ones and read back. if we get 00 (negative size), size = 4.
-            size = pci_cfg_readl(pci, bus->num, pdev->num, 0, 0x10);
-    
-            // mask all but size mask
-            if (bar & 0x1) { // I/O
-                size &= 0xfffffffc;
-            } else { // memory
-                size &= 0xfffffff0;
-            }
-            // two complement, get back the positive size
-            size = ~size;
-            size++;
-    
-            // now we have to put back the original bar
-            pci_cfg_writel(pci, bus->num, pdev->num, 0, 0x10, bar);
-    
-            if (size == 0) { // size = 0 -> non-existent bar, skip to next one
-                continue;
-            }
-    
-            uint32_t start = 0;
-            // we have a 64-bit address but bar1 is all zeros
-            state->mem_start = bar & 0xfffffff0;
-            state->mem_end = state->mem_start + size;
-            foundmem = 1;
-    
-            INFO("Adding nvme device: bus=%u dev=%u func=%u: mem_start=%p mem_end=%p\n",
-                 bus->num, pdev->num, 0,
-                 state->mem_start, state->mem_end);
-
-            uint16_t pci_cmd = NVME_PCI_CMD_MEM_ACCESS_EN | NVME_PCI_CMD_IO_ACCESS_EN | NVME_PCI_CMD_LANRW_EN | NVME_PCI_CMD_INT_DISABLE;
-            DEBUG("init fn: new pci cmd: 0x%04x\n", pci_cmd);
-            pci_cfg_writew(pci, bus->num, pdev->num, 0, NVME_PCI_CMD_OFFSET, pci_cmd);
-            DEBUG("init fn: pci_cmd 0x%04x expects 0x%04x\n",
-                pci_cfg_readw(pci, bus->num,pdev->num, 0, NVME_PCI_CMD_OFFSET),
-                pci_cmd);
-            DEBUG("init fn: pci status 0x%04x\n",
-                pci_cfg_readw(pci, bus->num,pdev->num, 0, NVME_PCI_STATUS_OFFSET));
-
-            // this line was causing general protection faults. 
-            // doesn't look immediately necessary, let's see if we can get away without it...
-            // list_add(&dev_list, &(state->dev->dev_list_node));
-            sprintf(state->dev->name, "nvme-%d", num);
-    
-        if (!foundmem) {
-            ERROR("init fn: ignoring device %s as it has no memory access method\n",state->dev->name);
-            continue;
-        }
-
-        // Check the controller version is supported.
-        volatile uint32_t version = READ_MEM(state, NVME_VS_OFFSET);
-        if (version != NVME_VERSION){
-            ERROR("Unsupported NVME version 0x%08x\n", version);
-            return -1;
-        }
-        DEBUG("Supported NVME version 0x%08x found\n", version);
-
-        volatile uint64_t cap = READ_MEM64(state, NVME_CAP_OFFSET);
-        // Check the capabilities register for support of the I/O NVMe command set.
-        if (!((cap >> 37) & 0x1)) {
-            ERROR("NVMe controller does not support I/O command set\n");
-            return -1;
-        }
-        DEBUG("NVMe controller supports I/O\n");
-
-        // Check the capabilities register for support of the host's page size.
-        // Memory page size max and min
-        uint32_t mpsmin = 1 << (12 + ((cap>>48) & 0xf));
-        uint32_t mpsmax = 1 << (12 + ((cap>>52) & 0xf));
-        DEBUG("mpsmin=0x%08x; mpsmax=0x%08x\n", (cap>>48) & 0xf, (cap>>52) & 0xf);
-        if (NVME_PAGE_SIZE < mpsmin || NVME_PAGE_SIZE > mpsmax){
-            ERROR("Unsupported nvme page size. min=0x%08x; max=0x%08x; actual=0x%08x\n", mpsmin, mpsmax, NVME_PAGE_SIZE);
-            return -1;
-        }
-        DEBUG("Supported nvme page size. min=0x%08x; max=0x%08x; actual=0x%08x\n", mpsmin, mpsmax, NVME_PAGE_SIZE);
-        state->dstrd = (cap>>32) & 0xf;
-        DEBUG("dstrd=0x%08x\n", state->dstrd);
-
-        // This is a supported NVMe device
-        state->pci_dev = pdev;
-
-        // NVME specific setup
+// reset controller, create admin queus, set config register (cc), and start controller
+int nvme_init_controller (struct nvme_dev *state) {
         // Reset the controller 
         // triggered by a falling edge on the Enable bit of the controller configuration register
         volatile uint32_t cc = READ_MEM(state, NVME_CC_OFFSET);
@@ -671,46 +564,11 @@ int nk_nvme_init(struct naut_info *naut)
             io_delay();
         }
         DEBUG("controller is ready\n");
+        return 0;
+}
 
-        // If we want interrupts, enable them and register a handler (skipping for now)
-
-        // Send the identify command to the controller. 
-        uint8_t id_data[4096]; // data structure returned by identify is 4096 bytes
-        memset(id_data, 0, sizeof(id_data));
+int nvme_init_create_and_configure_io_queues (struct nvme_dev *state) {
         struct nvme_completion comp;
-        if (nvme_identify_controller_cmd(state, id_data, &comp)){
-            ERROR("Identify controller command failed\n");
-            return -1;
-        };
-        // Check it is an IO controller
-        uint8_t ctrlr_type = id_data[111];
-        if (ctrlr_type != 0x1){
-            ERROR("Unsupported NVME controller type %u returned by Identify\n", ctrlr_type);
-            return -1;
-        }
-        // Record the maximum transfer size
-        uint8_t mdts = id_data[77];
-        DEBUG("max data transfer size=0x%08x\n", (1<<mdts)*mpsmin); // 0 indicates no max
-        state->mdts = mdts;
-
-        // Check allowable I/O Completion/Submission Queue Entry Size
-        uint8_t sqes = id_data[512];
-        uint16_t min_sqes = 1 << (sqes & 0xf); // should be 6
-        uint16_t max_sqes = 1 << (sqes >> 4);
-        uint16_t actual_sqes = 1 << NVME_SQES;
-        if (actual_sqes < min_sqes || actual_sqes > max_sqes){
-            ERROR("Unsupported nvme submission queue entry size. min=0x%08x; max=0x%08x; actual=0x%08x\n",  min_sqes, max_sqes, actual_sqes);
-            return -1;
-        }
-        uint8_t cqes = id_data[513];
-        uint16_t min_cqes = 1 << (cqes & 0xf);
-        uint16_t max_cqes = 1 << (cqes >> 4); // should be 4
-        uint16_t actual_cqes = 1 << NVME_CQES;
-        if (actual_cqes < min_cqes || actual_cqes > max_cqes){
-            ERROR("Unsupported nvme completion queue entry size. min=0x%08x; max=0x%08x; actual=0x%08x\n", min_cqes, max_cqes, actual_cqes);
-            return -1;
-        }
-        DEBUG("Supported submission and completion queues entry sizes\n");
         // Set number of I/O queues using Set Feature command
         // for now, we'll just have 1 sq and 1 cq
         uint16_t num_sq = 1;
@@ -723,7 +581,7 @@ int nk_nvme_init(struct naut_info *naut)
 
         // Set I/O Completion/Submission Queue Entry Size in controller configuration register
         // This must be done *before* actually creating I/O queues
-        cc = READ_MEM(state, NVME_CC_OFFSET);
+        volatile uint32_t cc = READ_MEM(state, NVME_CC_OFFSET);
         cc |= (NVME_CQES << 20);
         cc |= (NVME_SQES << 16);
         WRITE_MEM(state, NVME_CC_OFFSET, cc);
@@ -744,6 +602,7 @@ int nk_nvme_init(struct naut_info *naut)
             return -1;
         }
         state->io_sq = *sq;
+        // completion queues shall be created before submission queues
         if (create_io_completion_queue(state, &(state->io_cq)) ||
             create_io_submission_queue(state, &(state->io_sq))) 
         {
@@ -755,75 +614,290 @@ int nk_nvme_init(struct naut_info *naut)
             return -1;
         }
         DEBUG("created io queues\n");
-        // Do stuff with MSI here if we enable interrupts
-        // Identify active namespace IDs, and then identify individual namespaces. 
-        memset(id_data, 0, sizeof(id_data));
-        if (nvme_identify_ns_list_cmd(state, id_data, &comp)){
-            ERROR("Identify namespace command failed\n");
-            return -1;
-        }
-        // we could loop over this list of nsid's until we find a zero id (which indicates no more namespaces)
-        // however, qemu must be configured to add additional namespaces
-        // qemu defaults to a single namespace with nsid=1
-        // for now, let's just store info about the first one, but for good measure still send the identify namespace list command and get the nsid that way
-        uint32_t nsid0 = (id_data[2] << 16) | (id_data[1] << 8) | id_data[0];
-        DEBUG("Identify Namespace List returned nsid0=0x%06x\n", nsid0);
-        if (!nsid0){
-            ERROR("Namespace ID list is empty\n");
-            return -1;
-        }
+        return 0;
+}
 
-        memset(id_data, 0, sizeof(id_data));
-        if (nvme_identify_ns_cmd(state, id_data, nsid0, &comp)){
-            ERROR("Identify namespace command failed\n");
-            return -1;
-        }    
+// check controller capabilities are compatable and record max data transfer size
+int nvme_init_identify_controller(struct nvme_dev *state) {
+    // Send the identify command to the controller. 
+    uint8_t id_data[4096]; // data structure returned by identify is 4096 bytes
+    memset(id_data, 0, sizeof(id_data));
+    struct nvme_completion comp;
+    if (nvme_identify_controller_cmd(state, id_data, &comp)){
+        ERROR("Identify controller command failed\n");
+        return -1;
+    };
+    // Check it is an IO controller
+    uint8_t ctrlr_type = id_data[111];
+    if (ctrlr_type != 0x1){
+        ERROR("Unsupported NVME controller type %u returned by Identify\n", ctrlr_type);
+        return -1;
+    }
+    // Record the maximum transfer size
+    uint8_t mdts = id_data[77];
+    DEBUG("max data transfer size=0x%08x\n", (1<<mdts)*state->mpsmin); // 0 indicates no max
+    state->mdts = mdts;
+
+    // Check allowable I/O Completion/Submission Queue Entry Size
+    uint8_t sqes = id_data[512];
+    uint16_t min_sqes = 1 << (sqes & 0xf); // should be 6
+    uint16_t max_sqes = 1 << (sqes >> 4);
+    uint16_t actual_sqes = 1 << NVME_SQES;
+    if (actual_sqes < min_sqes || actual_sqes > max_sqes){
+        ERROR("Unsupported nvme submission queue entry size. min=0x%08x; max=0x%08x; actual=0x%08x\n",  min_sqes, max_sqes, actual_sqes);
+        return -1;
+    }
+    uint8_t cqes = id_data[513];
+    uint16_t min_cqes = 1 << (cqes & 0xf);
+    uint16_t max_cqes = 1 << (cqes >> 4); // should be 4
+    uint16_t actual_cqes = 1 << NVME_CQES;
+    if (actual_cqes < min_cqes || actual_cqes > max_cqes){
+        ERROR("Unsupported nvme completion queue entry size. min=0x%08x; max=0x%08x; actual=0x%08x\n", min_cqes, max_cqes, actual_cqes);
+        return -1;
+    }
+    DEBUG("Supported submission and completion queues entry sizes\n");
+    return 0;
+}
+
+// identify namespaces, get block size and number of blocks
+int nvme_init_identify_ns(struct nvme_dev *state) {
+    uint8_t id_data[4096]; // data structure returned by identify is 4096 bytes
+    memset(id_data, 0, sizeof(id_data));
+    struct nvme_completion comp;
+    if (nvme_identify_ns_list_cmd(state, id_data, &comp)){
+        ERROR("Identify namespace command failed\n");
+        return -1;
+    }
+    // we could loop over this list of nsid's until we find a zero id (which indicates no more namespaces)
+    // however, qemu must be configured to add additional namespaces
+    // qemu defaults to a single namespace with nsid=1
+    // for now, let's just store info about the first one, but for good measure still send the identify namespace list command and get the nsid that way
+    uint32_t nsid0 = (id_data[2] << 16) | (id_data[1] << 8) | id_data[0];
+    DEBUG("Identify Namespace List returned nsid0=0x%06x\n", nsid0);
+    if (!nsid0){
+        ERROR("Namespace ID list is empty\n");
+        return -1;
+    }
+
+    memset(id_data, 0, sizeof(id_data));
+    if (nvme_identify_ns_cmd(state, id_data, nsid0, &comp)){
+        ERROR("Identify namespace command failed\n");
+        return -1;
+    }    
+    
+    // Record namespace block size and capacity
+    struct nvme_namespace *ns0 = (struct nvme_namespace *)malloc(sizeof(struct nvme_namespace));
+    if (!ns0) {
+        ERROR("Cannot allocate NVMe namespace\n");
+        return -1;
+    }
+    memset(ns0, 0, sizeof(*ns0));
+    state->ns = ns0; // namespace
+    ns0->nsid = nsid0; // this should be 1 (for qemu's first ns)
+    ns0->nsze = read_arr_64le(id_data, 0); // num_blocks
+    state->num_blocks = ns0->nsze; // TODO: are num_blocks and block_size mandatory for block device state?
+    ns0->ncap = read_arr_64le(id_data, 8);
+    DEBUG("Namespace nsid=%u, nsze=%lu, ncap=%lu\n", ns0->nsid, ns0->nsze, ns0->ncap);
+    // Get logical block address (LBA) format and size
+    // LBA format. It's possible to have multiple, let's only care about the first one for now
+    // formatted LBA size: Index of the supported LBA format, not the actual size
+    uint8_t flbas = id_data[26] & 0xf; 
+    // LBA format
+    uint32_t lbaf = read_arr_32le(id_data, 128 + flbas);
+    // qemu defaults to 0 metadata bytes per LBA and no extended LBA. let's keep it that way for now
+    ns0->lbads = (lbaf>>16) & 0xf;
+    // actual lba data size = (2^lbads);
+    state->block_size = 1 << (ns0->lbads);
+    DEBUG("flbas=%u, lbaf=0x%08x, lbads=%u, block_size=%lu\n",
+        flbas, lbaf, ns0->lbads, state->block_size);
+    return 0;
+}
+
+int nk_nvme_init_register_blkdev(struct nvme_dev *state, uint16_t num) {
+
+    char blkdev_name[32];
+    sprintf(blkdev_name,"nvme-%d", num);
+    state->blkdev = nk_block_dev_register(blkdev_name, 0, &inter, state);
+    if (!state->blkdev) {
+        ERROR("Failed to register %s\n",blkdev_name);
+    }
+    INFO("Added nvme device %s, type %s, blocksize=%lu, numblocks=%lu\n",
+        blkdev_name,
+        state->type==HD ? "HD" : state->type==CD ? "CD" : "UNKNOWN", 
+        state->block_size,state->num_blocks );
+    num++;
+    INFO("%s potentially operational\n",state->dev->name);
+    return 0;
+}
+
+// all the nvme initialization steps that are independent of nautilus or pci
+int nvme_init_nvme_setup(struct nvme_dev *state) {
+    // NVME specific setup
+    if (nvme_init_controller(state)) {
+        ERROR("Failed to initialize NVMe controller\n");
+        return -1;
+    }
+
+    // send identify controller command and parse returned info
+    if (nvme_init_identify_controller(state)){
+        ERROR("Failed to identify controller\n");
+        return -1;
+    }
+    
+    // Identify active namespace IDs, and then identify individual namespaces. 
+    if (nvme_init_identify_ns(state)){
+        ERROR("Failed to identify namespaces\n");
+        return -1;
+    }
+
+    // allocate io queues, register with controller, and set sizes
+    if (nvme_init_create_and_configure_io_queues(state)) {
+        ERROR("Failed to create and configure I/O queues\n");
+        return -1;
+    };
+
+    // If we want interrupts, enable them and register a handler (skipping for now)
+    // Also do stuff with MSI
+
+    return 0;
+}
+
+// PCI initialization mostly copied from e1000e_pci_init
+int nk_nvme_init(struct naut_info *naut)
+{
+    struct pci_info *pci = nk_get_nautilus_info()->sys.pci;
+    struct list_head *curbus, *curdev;
+    uint16_t num = 0;
+    
+    INFO("init\n");
+    
+    if (!pci) {
+        ERROR("No PCI info\n");
+        return -1;
+    }
+
+    struct nvme_dev *state = (struct nvme_dev *)malloc(sizeof(struct nvme_dev));
+    if (!state) {
+        ERROR("Cannot allocate NVMe device state\n");
+        return -1;
+    }
+    memset(state, 0, sizeof(*state));
+
+    INIT_LIST_HEAD(&dev_list);    
+    DEBUG("Finding NVMe devices\n");
+
+    list_for_each(curbus,&(pci->bus_list)) {
+        struct pci_bus *bus = list_entry(curbus,struct pci_bus,bus_node);
+    
+        DEBUG("Searching PCI bus %u for NVMe devices\n", bus->num);
+    
+        list_for_each(curdev, &(bus->dev_list)) {
+            struct pci_dev *pdev = list_entry(curdev,struct pci_dev,dev_node);
+            struct pci_cfg_space *cfg = &pdev->cfg;
         
-        // Record namespace block size and capacity
-        struct nvme_namespace *ns0 = (struct nvme_namespace *)malloc(sizeof(struct nvme_namespace));
-        if (!ns0) {
-            ERROR("Cannot allocate NVMe namespace\n");
-            return -1;
-        }
-        memset(ns0, 0, sizeof(*ns0));
-        state->ns = ns0; // namespace
-        ns0->nsid = nsid0; // this should be 1 (for qemu's first ns)
-        ns0->nsze = read_arr_64le(id_data, 0); // num_blocks
-        state->num_blocks = ns0->nsze; // TODO: are num_blocks and block_size mandatory for block device state?
-        ns0->ncap = read_arr_64le(id_data, 8);
-        DEBUG("Namespace nsid=%u, nsze=%lu, ncap=%lu\n", ns0->nsid, ns0->nsze, ns0->ncap);
-        // Get logical block address (LBA) format and size
-        // LBA format. It's possible to have multiple, let's only care about the first one for now
-        // formatted LBA size: Index of the supported LBA format, not the actual size
-        uint8_t flbas = id_data[26] & 0xf; 
-        // LBA format
-        uint32_t lbaf = read_arr_32le(id_data, 128 + flbas);
-        // qemu defaults to 0 metadata bytes per LBA and no extended LBA. let's keep it that way for now
-        ns0->lbads = (lbaf>>16) & 0xf;
-        // actual lba data size = (2^lbads);
-        state->block_size = 1 << (ns0->lbads);
-        DEBUG("flbas=%u, lbaf=0x%08x, lbads=%u, block_size=%lu\n",
-            flbas, lbaf, ns0->lbads, state->block_size);
-        // now that we have block size and number of blocks, register block device (mostly copied from ata.c)
-        char blkdev_name[32];
-        sprintf(blkdev_name,"nvme-%d", num);
-        state->blkdev = nk_block_dev_register(blkdev_name, 0, &inter, state);
-        if (!state->blkdev) {
-            ERROR("Failed to register %s\n",blkdev_name);
-        }
-        INFO("Added nvme device %s, type %s, blocksize=%lu, numblocks=%lu\n",
-            blkdev_name,
-            state->type==HD ? "HD" : state->type==CD ? "CD" : "UNKNOWN", 
-            state->block_size,state->num_blocks );
-        num++;
-        INFO("%s potentially operational\n",state->dev->name);
-        }
+            DEBUG("Device %u is a 0x%x:0x%x\n", pdev->num, cfg->vendor_id, cfg->device_id);
+            // intel vendor id and e1000e device id
+            if (cfg->vendor_id==NVME_VENDOR_ID && cfg->device_id==NVME_DEVICE_ID) {
+                int foundio=0, foundmem=0;
+            
+                DEBUG("Found NVMe Device\n");
+
+                // We will *not* support interrupts for now
+        
+                // find out the bar for NVMe
+                // only care about bar0
+                uint32_t bar = pci_cfg_readl(pci,bus->num, pdev->num, 0, 0x10);
+                uint32_t size;
+                DEBUG("bar 0: 0x%0x\n", bar);
+
+                // get the last bit and if it is zero, it is the memory
+                // " -------------------------"	one, it is the io
+                if (!(bar & 0x1)) {
+                    uint8_t mem_bar_type = (bar & 0x6) >> 1;
+                    if (mem_bar_type != 2) { 
+                        // 64 bit address that we do not handle it
+                        ERROR("Cannot handle memory bar type 0x%x\n", mem_bar_type);
+                        return -1;
+                    }
+                }
+        
+                // determine size
+                // write all 1s, get back the size mask
+                pci_cfg_writel(pci, bus->num, pdev->num, 0, 0x10, 0xffffffff);
+                // size mask comes back + info bits
+                // write all ones and read back. if we get 00 (negative size), size = 4.
+                size = pci_cfg_readl(pci, bus->num, pdev->num, 0, 0x10);
+        
+                // mask all but size mask
+                if (bar & 0x1) { // I/O
+                    size &= 0xfffffffc;
+                } else { // memory
+                    size &= 0xfffffff0;
+                }
+                // two complement, get back the positive size
+                size = ~size;
+                size++;
+        
+                // now we have to put back the original bar
+                pci_cfg_writel(pci, bus->num, pdev->num, 0, 0x10, bar);
+        
+                if (size == 0) { // size = 0 -> non-existent bar, skip to next one
+                    continue;
+                }
+        
+                uint32_t start = 0;
+                // we have a 64-bit address but bar1 is all zeros
+                state->mem_start = bar & 0xfffffff0;
+                state->mem_end = state->mem_start + size;
+                foundmem = 1;
+        
+                INFO("Adding nvme device: bus=%u dev=%u func=%u: mem_start=%p mem_end=%p\n",
+                    bus->num, pdev->num, 0,
+                    state->mem_start, state->mem_end);
+
+                uint16_t pci_cmd = NVME_PCI_CMD_MEM_ACCESS_EN | NVME_PCI_CMD_IO_ACCESS_EN | NVME_PCI_CMD_LANRW_EN | NVME_PCI_CMD_INT_DISABLE;
+                DEBUG("init fn: new pci cmd: 0x%04x\n", pci_cmd);
+                pci_cfg_writew(pci, bus->num, pdev->num, 0, NVME_PCI_CMD_OFFSET, pci_cmd);
+                DEBUG("init fn: pci_cmd 0x%04x expects 0x%04x\n",
+                    pci_cfg_readw(pci, bus->num,pdev->num, 0, NVME_PCI_CMD_OFFSET),
+                    pci_cmd);
+                DEBUG("init fn: pci status 0x%04x\n",
+                    pci_cfg_readw(pci, bus->num,pdev->num, 0, NVME_PCI_STATUS_OFFSET));
+
+                // this line was causing general protection faults. 
+                // doesn't look immediately necessary, let's see if we can get away without it...
+                // list_add(&dev_list, &(state->dev->dev_list_node));
+                sprintf(state->dev->name, "nvme-%d", num);
+            
+                if (!foundmem) {
+                    ERROR("init fn: ignoring device %s as it has no memory access method\n",state->dev->name);
+                    continue;
+                }
+
+                if (nvme_init_check_pci_cap(state)) {
+                    ERROR("init fn: NVMe PCI capabilities check failed for device %s\n", state->dev->name);
+                    continue;
+                }
+
+                // This is a supported NVMe device
+                state->pci_dev = pdev;
+
+                // PCI/nautilus idependent
+                nvme_init_nvme_setup(state);
+
+                // now that we have block size and number of blocks, register block device (mostly copied from ata.c)
+                if (nk_nvme_init_register_blkdev(state, num)){
+                    ERROR("Failed to register NVMe block device\n");
+                    return -1;
+                }
+            }
         }
     }
     // TODO: how to store state better than this?
     nvme = state;
     return 0;
 }
+
 
 void nk_nvme_deinit()
 {
