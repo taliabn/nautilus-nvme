@@ -102,12 +102,11 @@ struct nvme_dev {
 // static variables
 // list of discovered devices
 static struct list_head dev_list;
+static struct nvme_dev* nvme;
 
 // forward declarations:
 int nvme_create_io_sq_cmd(struct nvme_dev *nvme, uint16_t sq_id, uint16_t cq_id, nvme_sq *io_sq, struct nvme_completion *comp);
 int nvme_create_io_cq_cmd(struct nvme_dev *nvme, uint16_t cq_id, nvme_cq *io_cq, struct nvme_completion *comp);
-void nvme_write_reg(uint32_t offset, uint32_t value){}; // TODO: actually write this
-static int nvme_pci_init(struct nvme_dev *state);
 
 // helper functions
 static inline volatile uint32_t read_arr_32le(volatile uint8_t * d, uint16_t o){
@@ -203,7 +202,7 @@ int create_admin_completion_queue(struct nvme_dev *nvme) {
 
 int create_io_submission_queue(struct nvme_dev *nvme, nvme_sq *sq) {
 	sq->size = 63;
-    sq->ring_buff = create_ring_buffer(sq->size, sizeof(struct nvme_command));
+    sq->ring_buff = create_ring_buffer(sq->size + 1, sizeof(struct nvme_command));
     if (sq->ring_buff==NULL) { // malloc failed
         return -1;
     }
@@ -225,7 +224,7 @@ int create_io_submission_queue(struct nvme_dev *nvme, nvme_sq *sq) {
 
 int create_io_completion_queue(struct nvme_dev *nvme, nvme_cq *cq) {
 	cq->size = 63;
-    cq->ring_buff = create_ring_buffer(cq->size, sizeof(struct nvme_completion));
+    cq->ring_buff = create_ring_buffer(cq->size + 1, sizeof(struct nvme_completion));
     if (cq->ring_buff==NULL) { // malloc failed
         return -1;
     }
@@ -257,7 +256,7 @@ static int nvme_queue_submit_cmd(struct nvme_dev *nvme, struct nvme_queue *sq, s
     // DEBUG("sq_entry: 0x%lx\n", sq_entry);
     // DEBUG("cq_entry: 0x%lx\n", cq_entry);
 
-    uint16_t sq_tail_doorbell = 0x1000 + 2*sq->id * (4 << nvme->dstrd);    
+    uint16_t sq_tail_doorbell = 0x1000 + ((2*sq->id) * (4 << nvme->dstrd));    
     // enqueue command in submission queue
 	sq->tail++;
     if (sq->head == sq->tail + 1){
@@ -279,12 +278,22 @@ static int nvme_queue_submit_cmd(struct nvme_dev *nvme, struct nvme_queue *sq, s
     // poll
     // hardware will invert phase tag bit upon every write to cq
     // we can use this to tell if the controller has written a new completion entry
+    uint64_t timeout = 10000;
+    uint64_t i = 0;
     while(cq_entry->phase_tag == prev_phase_tag){
+        // if (i>timeout){
+        //     ERROR("Timed out waiting for command to be processed!\n");
+        //     if (check_csts_fatal_status(nvme)){
+        //         ERROR("Fatal controller error!\n");
+        //     }
+        //     return -1;
+        // }
+        i++;
         io_delay();
     };
     // DEBUG("cq_entry->phase_tag: %d\n", cq_entry->phase_tag);
     // DEBUG("command processed\n");
-    uint16_t cq_head_doorbell = 0x1000 + 2*(cq->id + 1) * (4 << nvme->dstrd);
+    uint16_t cq_head_doorbell = 0x1000 + (((2*cq->id) + 1) * (4 << nvme->dstrd));
     // dequeue completion from completion queue
     cq->head++;
 	if (cq->head == (cq->size + 1)){
@@ -294,14 +303,16 @@ static int nvme_queue_submit_cmd(struct nvme_dev *nvme, struct nvme_queue *sq, s
     sq->head = cq_entry->sq_head;  
     // DEBUG("sq->head: %d\n", cq->head);
     // DEBUG("cq->head: %d\n", cq->head);
-    // *don't* overwrite consumed cq entry or else undefined "hw" behavior
+    // NOTE: *don't* overwrite consumed sq or cq entry or else undefined "hw" behavior
+        // we also want to preserve phase tag bit
+    // copy completion entry to comp
     memcpy((void*)comp, (void*)cq_entry, sizeof(struct nvme_completion));
     // DEBUG("read from cq_entry: 0x%lx\n", cq_entry);
     // ring completion queue doorbell by writing address to register
     WRITE_MEM(nvme, cq_head_doorbell, cq->head);
     // DEBUG("wrote to cq_head_doorbell\n");
-    DEBUG("sq->tail: %d, sq->head: %d, cq->head: %d\n", sq->tail, sq->head, cq->head);
-    DEBUG("command completed with status: %d\n", comp->status);
+    // DEBUG("sq->tail: %d, sq->head: %d, cq->head: %d\n", sq->tail, sq->head, cq->head);
+    DEBUG("command completed with status: 0x%08x and took %d ticks\n", comp->status, i);
     return comp->status;
 }
 
@@ -312,7 +323,7 @@ static int nvme_submit_admin_cmd(struct nvme_dev *nvme, struct nvme_command *cmd
 
 static int nvme_submit_io_cmd(struct nvme_dev *nvme, struct nvme_command *cmd, struct nvme_completion *comp)
 {
-    return nvme_queue_submit_cmd(nvme, &(nvme->io_sq), &(nvme->io_sq), cmd, comp);
+    return nvme_queue_submit_cmd(nvme, &(nvme->io_sq), &(nvme->io_cq), cmd, comp);
 }
 
 /* IO Commands */
@@ -320,6 +331,10 @@ static int nvme_submit_io_cmd(struct nvme_dev *nvme, struct nvme_command *cmd, s
 static int nvme_rw_cmd(struct nvme_dev *nvme, uint8_t opc, uint32_t nsid, 
                 void *buff, uint64_t lba, uint32_t num_blocks, struct nvme_completion *comp)
 {
+    if ((uintptr_t)buff & (NVME_PAGE_SIZE - 1)) {
+        ERROR("Buffer address is not aligned to page size!\n");
+        return -1;
+    }
     struct nvme_command cmd;
     memset(&cmd, 0, sizeof(cmd));
 
@@ -329,6 +344,9 @@ static int nvme_rw_cmd(struct nvme_dev *nvme, uint8_t opc, uint32_t nsid,
     cmd.cdw10 = htole32(lba & 0xffffffffu);
 	cmd.cdw11 = htole32(lba >> 32);
 	cmd.cdw12 = htole32(num_blocks-1);
+
+    DEBUG("Submitting rw command: opc=0x%x, nsid=0x%x, prp1=0x%lx, lba=0x%lx, num_blocks=0x%x\n",
+        cmd.opc, cmd.nsid, cmd.prp1, lba, num_blocks);
 
     return nvme_submit_io_cmd(nvme, &cmd, comp);
 }
@@ -398,11 +416,37 @@ int nvme_create_io_cq_cmd(struct nvme_dev *nvme, uint16_t cq_id, nvme_cq *io_cq,
 	cmd.opc = NVME_OPC_CREATE_IO_CQ;
 	cmd.prp1 = htole64(io_cq->addr);
 	cmd.cdw10 = htole32(((io_cq->size) << 16) | cq_id);
-    // otherwise, specify MSI vector + 1 in highword of DWORD11
+    // if we were using interrupts, specify MSI vector + 1 in highword of DWORD11
 	/* flags 0x1 = interrupts not enabled, physically contiguous */
 	cmd.cdw11 = htole32(0x01);
     
     return nvme_submit_admin_cmd(nvme, &cmd, comp); 
+}
+
+
+int nvme_set_features_cmd(struct nvme_dev *nvme, uint8_t feature,
+    uint32_t cdw11,  uint32_t cdw12, uint32_t cdw13, uint32_t cdw14,
+    uint32_t cdw15, struct nvme_completion *comp){
+    struct nvme_command cmd;
+    memset(&cmd, 0, sizeof(cmd));
+
+	cmd.opc = NVME_OPC_SET_FEATURES;
+	cmd.cdw10 = htole32(feature);
+	cmd.cdw11 = htole32(cdw11);
+	cmd.cdw12 = htole32(cdw12);
+	cmd.cdw13 = htole32(cdw13);
+	cmd.cdw14 = htole32(cdw14);
+	cmd.cdw15 = htole32(cdw15);
+
+    return nvme_submit_admin_cmd(nvme, &cmd, comp); 
+}
+
+int nvme_set_num_io_queues(struct nvme_dev *nvme, uint16_t num_sq, uint16_t num_cq, struct nvme_completion *comp){
+	uint32_t cdw11;
+
+	cdw11 = ((num_cq - 1) << 16) | (num_sq - 1);
+	return nvme_set_features_cmd(nvme, NVME_FEAT_NUMBER_OF_QUEUES, cdw11,
+	    0, 0, 0, 0, comp);
 }
 
 static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest, void (*callback)(nk_block_dev_status_t, void *), void *context){
@@ -449,12 +493,12 @@ int nk_nvme_init(struct naut_info *naut)
         return -1;
     }
 
-    struct nvme_dev *device = (struct nvme_dev *)malloc(sizeof(struct nvme_dev));
-    memset(device, 0, sizeof(struct nvme_dev));
-    if (!device) {
+    struct nvme_dev *state = (struct nvme_dev *)malloc(sizeof(struct nvme_dev));
+    if (!state) {
         ERROR("Cannot allocate NVMe device state\n");
         return -1;
     }
+    memset(state, 0, sizeof(*state));
 
     INIT_LIST_HEAD(&dev_list);    
     DEBUG("Finding NVMe devices\n");
@@ -475,13 +519,6 @@ int nk_nvme_init(struct naut_info *naut)
         
             DEBUG("Found NVMe Device\n");
 
-            struct nvme_dev *state = (struct nvme_dev *)malloc(sizeof(struct nvme_dev));
-            if (!state) {
-                ERROR("Cannot allocate NVMe device state\n");
-                return -1;
-            }
-            memset(state, 0, sizeof(*state));
-        
             // We will *not* support interrupts for now
     
             // find out the bar for NVMe
@@ -579,7 +616,7 @@ int nk_nvme_init(struct naut_info *naut)
             return -1;
         }
         DEBUG("Supported nvme page size. min=0x%08x; max=0x%08x; actual=0x%08x\n", mpsmin, mpsmax, NVME_PAGE_SIZE);
-        state->dstrd = 1 << (2 + ((cap>>32) & 0xf));
+        state->dstrd = (cap>>32) & 0xf;
         DEBUG("dstrd=0x%08x\n", state->dstrd);
 
         // This is a supported NVMe device
@@ -615,6 +652,7 @@ int nk_nvme_init(struct naut_info *naut)
         // Set the controller configuration
         cc = READ_MEM(state, NVME_CC_OFFSET);
         // We'll leave arbitration mechanism (AMS) as default (round robin)
+            // But that's irrelevant while we only have a single I/O submission queue
         // command set selected (CSS) should support I/O by default
         // Set max page size (MPS)
         cc |= NVME_MPS << 7; // memory page size is (2 ^ (12 + MPS))
@@ -673,6 +711,16 @@ int nk_nvme_init(struct naut_info *naut)
             return -1;
         }
         DEBUG("Supported submission and completion queues entry sizes\n");
+        // Set number of I/O queues using Set Feature command
+        // for now, we'll just have 1 sq and 1 cq
+        uint16_t num_sq = 1;
+        uint16_t num_cq = 1;
+        if (nvme_set_num_io_queues(state, num_sq, num_cq, &comp)){
+            ERROR("failed to set num IO queues!\n");
+            return -1;
+        }
+        DEBUG("Set num I/O queues\n");
+
         // Set I/O Completion/Submission Queue Entry Size in controller configuration register
         // This must be done *before* actually creating I/O queues
         cc = READ_MEM(state, NVME_CC_OFFSET);
@@ -696,8 +744,8 @@ int nk_nvme_init(struct naut_info *naut)
             return -1;
         }
         state->io_sq = *sq;
-        if (create_io_completion_queue(state, &(state->io_sq)) ||
-            create_io_submission_queue(state, &(state->io_cq))) 
+        if (create_io_completion_queue(state, &(state->io_cq)) ||
+            create_io_submission_queue(state, &(state->io_sq))) 
         {
             ERROR("Failure to create io queues\n");
             return -1;
@@ -738,22 +786,24 @@ int nk_nvme_init(struct naut_info *naut)
             return -1;
         }
         memset(ns0, 0, sizeof(*ns0));
-        state->ns = ns0;
-        ns0->nsid = nsid0; // this should be one (for qemu's first ns)
+        state->ns = ns0; // namespace
+        ns0->nsid = nsid0; // this should be 1 (for qemu's first ns)
         ns0->nsze = read_arr_64le(id_data, 0); // num_blocks
         state->num_blocks = ns0->nsze; // TODO: are num_blocks and block_size mandatory for block device state?
         ns0->ncap = read_arr_64le(id_data, 8);
         DEBUG("Namespace nsid=%u, nsze=%lu, ncap=%lu\n", ns0->nsid, ns0->nsze, ns0->ncap);
-        // TODO: state->block_size is 64 bits. Ours might not fit? check
+        // Get logical block address (LBA) format and size
         // LBA format. It's possible to have multiple, let's only care about the first one for now
-        uint8_t lba_format_idx = id_data[26] & 0xf;
-        uint32_t lba_format = read_arr_32le(id_data, 128 + lba_format_idx);
+        // formatted LBA size: Index of the supported LBA format, not the actual size
+        uint8_t flbas = id_data[26] & 0xf; 
+        // LBA format
+        uint32_t lbaf = read_arr_32le(id_data, 128 + flbas);
         // qemu defaults to 0 metadata bytes per LBA and no extended LBA. let's keep it that way for now
-        ns0->lbads = (lba_format>>16) & 0xf;
+        ns0->lbads = (lbaf>>16) & 0xf;
         // actual lba data size = (2^lbads);
         state->block_size = 1 << (ns0->lbads);
-        DEBUG("LBA Format Index=%u, lba_format=0x%08x, lbads=%u, block_size=%lu\n",
-            lba_format_idx, lba_format, ns0->lbads, state->block_size);
+        DEBUG("flbas=%u, lbaf=0x%08x, lbads=%u, block_size=%lu\n",
+            flbas, lbaf, ns0->lbads, state->block_size);
         // now that we have block size and number of blocks, register block device (mostly copied from ata.c)
         char blkdev_name[32];
         sprintf(blkdev_name,"nvme-%d", num);
@@ -770,6 +820,8 @@ int nk_nvme_init(struct naut_info *naut)
         }
         }
     }
+    // TODO: how to store state better than this?
+    nvme = state;
     return 0;
 }
 
@@ -778,20 +830,71 @@ void nk_nvme_deinit()
     INFO("deinit\n");
 }
 
-// this is a fairly meaningless test for now
 static int handle_nvmetest (char *buf, void *priv)
 {
     nk_vc_printf("hello from nvme test!\n");
-    struct nvme_dev nvme;
-    uint8_t data[2048];
-    // qemu defaults nsid to zero
+    DEBUG("nvme state info: mdts=0x%08x, block_size=%d, num_blocks=%d, nsid=%d\n", nvme->mdts, nvme->block_size, nvme->num_blocks, nvme->ns->nsid);
+    uint8_t id_data[4096];
+    memset(id_data, 0, sizeof(id_data));
+
     struct nvme_completion comp;
-    uint32_t nsid = 0;
-    nvme_identify_ns_cmd(&nvme, data, nsid, &comp);
     uint64_t lba = 0;
     uint32_t num_blocks = 1;
-    nvme_read_cmd(&nvme, nsid, data, lba, num_blocks, &comp);
-    nvme_write_cmd(&nvme, nsid, data, lba, num_blocks, &comp);
+    int status;
+    if (nvme_identify_controller_cmd(nvme, id_data, &comp)){
+        ERROR("Identify controller command failed\n");
+        return -1;
+    };
+    // sanity check minimum queue entry sizes
+    // min sqes and min cqes should be 6 and 4 respectively
+    if ((id_data[512]&0xf)!=0x6 || (id_data[513]&0xf)!=0x4){
+        DEBUG("Failed Identify sanity check!\n");
+        return -1;
+    }
+    uint8_t *data = malloc(NVME_PAGE_SIZE);
+    memset(data, 0, NVME_PAGE_SIZE);
+
+    // drive storage is persistant, so clear it first
+    status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
+    if (status){
+        ERROR("Write command failed! with code 0x%08x\n", status);
+        return -1;
+    };
+    // read back what should be zeros
+    status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
+    if (status){
+        ERROR("read command failed! with code 0x%08x\n", status);
+        return -1;
+    };
+    for (int i=0; i<nvme->block_size; i++){
+        if (data[i] != 0){
+            ERROR("data[%d] = 0x%02x, expected 0\n", i, data[i]);
+            return -1;
+        }
+    }
+    DEBUG("PASSED WRITE + READ ZERO TEST\n");
+
+    // generate and write some data
+    for (int i=0; i<nvme->block_size; i++){
+        data[i] = i % 256;
+    }
+    status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
+    if (status){
+        ERROR("Write command failed! with code 0x%08x\n", status);
+        return -1;
+    };
+    status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
+    if (status){
+        ERROR("read command failed! with code 0x%08x\n", status);
+        return -1;
+    };
+    for (int i=0; i<nvme->block_size; i++){
+        if (data[i] != (i % 256)){
+            ERROR("data[%d] = 0x%02x, expected 0x%02x\n", i, data[i], (i % 256));
+            return -1;
+        }
+    }
+    DEBUG("PASSED WRITE + READ DATA TEST\n");
     return 0;
 }
 

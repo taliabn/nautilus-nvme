@@ -58,8 +58,8 @@ void nk_nvme_deinit();
 #define NVME_ACQ_OFFSET 0x30 // Admin Completion Queue Base Address
 // NVME config values
 #define NVME_VERSION 0x00010400 // version 1.4
-#define NVME_MPS 4 // 4 bits wide
-#define NVME_PAGE_SIZE 1 << (12 + NVME_MPS) // should be between 0x1000 and 0x10000
+#define NVME_MPS 3 // 4 bits wide
+#define NVME_PAGE_SIZE (1 << (12 + NVME_MPS)) // should be between 0x1000 and 0x10000 for QMEU's NVMe controller
 #define NVME_SQES 6 //  I/O Submission Queue Entry Size (specified as 2^n)
 #define NVME_CQES 4 //  I/O Completion Queue Entry Size (specified as 2^n)
 // Admin queue sizes are 0's based and units are number of entries
@@ -124,6 +124,9 @@ enum nvme_admin_opcode {
 	NVME_OPC_SET_FEATURES			= 0x09,
 	NVME_OPC_GET_FEATURES			= 0x0a,
 };
+
+// for nvme get/set feature commands
+#define NVME_FEAT_NUMBER_OF_QUEUES 0x07
 
 // for identify admin command, which subsystem to get info about
 enum nvme_identify_cns{
