@@ -108,7 +108,7 @@ static struct nvme_dev* nvme;
 // forward declarations:
 int nvme_create_io_sq_cmd(struct nvme_dev *nvme, uint16_t sq_id, uint16_t cq_id, nvme_sq *io_sq, struct nvme_completion *comp);
 int nvme_create_io_cq_cmd(struct nvme_dev *nvme, uint16_t cq_id, nvme_cq *io_cq, struct nvme_completion *comp);
-
+static int check_block_count(struct nvme_dev *nvme, uint64_t blocknum, uint64_t count);
 // helper functions
 static inline volatile uint32_t read_arr_32le(volatile uint8_t * d, uint16_t o){
     uint32_t ret = 0;
@@ -332,10 +332,11 @@ static int nvme_submit_io_cmd(struct nvme_dev *nvme, struct nvme_command *cmd, s
 static int nvme_rw_cmd(struct nvme_dev *nvme, uint8_t opc, uint32_t nsid, 
                 void *buff, uint64_t lba, uint32_t num_blocks, struct nvme_completion *comp)
 {
-    if ((uintptr_t)buff & (NVME_PAGE_SIZE - 1)) {
-        ERROR("Buffer address is not aligned to page size!\n");
-        return -1;
-    }
+    // if ((uintptr_t)buff & (NVME_PAGE_SIZE - 1)) {
+    //     ERROR("Buffer address is not aligned to page size!\n");
+    //     return -1;
+    // }
+    check_block_count(nvme, lba, num_blocks);
     struct nvme_command cmd;
     memset(&cmd, 0, sizeof(cmd));
 
@@ -448,25 +449,76 @@ int nvme_set_num_io_queues(struct nvme_dev *nvme, uint16_t num_sq, uint16_t num_
 	    0, 0, 0, 0, comp);
 }
 
-static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest, void (*callback)(nk_block_dev_status_t, void *), void *context){
-    // TODO: WRITEME!
+static int check_block_count(struct nvme_dev *nvme, uint64_t blocknum, uint64_t count) {
+    // check if blocknum and count are within bounds
+    if (blocknum >= nvme->num_blocks || count == 0 || (blocknum + count) > nvme->num_blocks) {
+        ERROR("Block number or count out of bounds! blocknum: %lu, count: %lu, num_blocks: %lu\n", blocknum, count, nvme->num_blocks);
+        return -1;
+    }
+    if (count * nvme->block_size > NVME_PAGE_SIZE) {
+        ERROR("Block count * block size exceeds one page! count: %lu, block_size: %lu, mpsmin: %lu\n", count, nvme->block_size, nvme->mpsmin);
+        return -1;
+    }
+    // maybe need to check alignment?
     return 0;
+}
+
+static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest, void (*callback)(nk_block_dev_status_t, void *), void *context)
+{
+    // TODO: locks or something
+    struct nvme_dev *s = (struct nvme_dev *)state;
+    struct nvme_completion comp;
+    int nvme_status = nvme_read_cmd(nvme, nvme->ns->nsid, dest, blocknum, count, &comp);
+    nk_block_dev_status_t blk_dev_status;
+
+    if (nvme_status){
+        ERROR("NVMe read command failed! with code 0x%08x\n", nvme_status);
+        blk_dev_status = NK_BLOCK_DEV_STATUS_ERROR;
+    } else {
+        blk_dev_status = NK_BLOCK_DEV_STATUS_SUCCESS;
+        DEBUG("NVMe read command succeeded!\n");
+    }
+
+    if (callback) {
+        DEBUG("calling callback\n");
+        callback(blk_dev_status, context);
+    }
+
+    return nvme_status;
 }
 
 static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *src, void (*callback)(nk_block_dev_status_t, void *), void *context)
 {
-    // TODO: WRITEME!
-    return 0;
+    // TODO: locks or something
+    struct nvme_dev *s = (struct nvme_dev *)state;
+    struct nvme_completion comp;
+    int nvme_status = nvme_write_cmd(nvme, nvme->ns->nsid, src, blocknum, count, &comp);
+    nk_block_dev_status_t blk_dev_status;
+
+    if (nvme_status){
+        ERROR("NVMe read command failed! with code 0x%08x\n", nvme_status);
+        blk_dev_status = NK_BLOCK_DEV_STATUS_ERROR;
+    } else {
+        blk_dev_status = NK_BLOCK_DEV_STATUS_SUCCESS;
+        DEBUG("NVMe write command succeeded!\n");
+    }
+
+    if (callback) {
+        DEBUG("calling callback\n");
+        callback(blk_dev_status, context);
+    }
+
+    return nvme_status;
 }
 
 static int get_characteristics(void *state, struct nk_block_dev_characteristics *c)
 {
     // STATE_LOCK_CONF;
-    // struct ata_blkdev_state *s = (struct ata_blkdev_state *)state;
+    struct nvme_dev *s = (struct nvme_dev *)state;
     
     // STATE_LOCK(s);
-    // c->block_size = s->block_size;
-    // c->num_blocks = s->num_blocks;
+    c->block_size = s->block_size;
+    c->num_blocks = s->num_blocks;
     // STATE_UNLOCK(s);
     return 0;
 }
