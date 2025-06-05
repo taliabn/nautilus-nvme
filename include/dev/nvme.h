@@ -58,7 +58,14 @@ void nk_nvme_deinit();
 #define NVME_ACQ_OFFSET 0x30 // Admin Completion Queue Base Address
 // NVME config values
 #define NVME_VERSION 0x00010400 // version 1.4
-#define NVME_MPS 3 // 4 bits wide
+// Allegedly QEMU might only support 4096 page size (hard coded macro in source code)
+// https://github.com/nvmeqemu/nvmeqemu/pulls
+// even thought this doesn't follow the NVME spec...
+// but their "hw" advertises a min MPS=0, 
+// but Identify command doesn't even work if we set MPS=0...
+// even though the spec says MPS=0 means 4096 page size.
+// I'm confused
+#define NVME_MPS 1 // 4 bits wide
 #define NVME_PAGE_SIZE (1 << (12 + NVME_MPS)) // should be between 0x1000 and 0x10000 for QMEU's NVMe controller
 #define NVME_SQES 6 //  I/O Submission Queue Entry Size (specified as 2^n)
 #define NVME_CQES 4 //  I/O Completion Queue Entry Size (specified as 2^n)
@@ -66,7 +73,11 @@ void nk_nvme_deinit();
 // Min number of entries is 2 and max number of entries is 4096
 #define NVME_ACQS 63 // Admin Completion Queue Size 
 #define NVME_ASQS 63 // Admin Submission Queue Size
-
+// for nvme get/set feature commands
+#define NVME_FEAT_NUMBER_OF_QUEUES 0x07
+// size of physical regio page (PRP) list
+// determines how many pages of data can be transferred at once
+#define NVME_NUM_PRP 512 // max pages is actually one more, specify address of first page elsewhere
 /* NVMe types */
 
 
@@ -125,8 +136,6 @@ enum nvme_admin_opcode {
 	NVME_OPC_GET_FEATURES			= 0x0a,
 };
 
-// for nvme get/set feature commands
-#define NVME_FEAT_NUMBER_OF_QUEUES 0x07
 
 // for identify admin command, which subsystem to get info about
 enum nvme_identify_cns{

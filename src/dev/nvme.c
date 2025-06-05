@@ -86,7 +86,7 @@ struct nvme_dev {
     nvme_sq io_sq; // For now 1
     nvme_cq io_cq; // For now 1
     uint8_t buffer; // Suggets 2 MiB buffer, but probably unnecesary since Nautilus doesn't page
-    uint64_t prp_list[512];
+    uint64_t prp_list[NVME_NUM_PRP]; // physical region page list
     uint32_t* namespaces; // For now empty, can implement as linked list
     // ^^ probably want to use the pre-existing nautilus linked list implementation
     // for now let's have a struct with a single namespace
@@ -108,7 +108,7 @@ static struct nvme_dev* nvme;
 // forward declarations:
 int nvme_create_io_sq_cmd(struct nvme_dev *nvme, uint16_t sq_id, uint16_t cq_id, nvme_sq *io_sq, struct nvme_completion *comp);
 int nvme_create_io_cq_cmd(struct nvme_dev *nvme, uint16_t cq_id, nvme_cq *io_cq, struct nvme_completion *comp);
-static int check_block_count(struct nvme_dev *nvme, uint64_t blocknum, uint64_t count);
+static int check_block_count(struct nvme_dev *nvme, uint64_t lba, uint64_t num_blocks, uint32_t nsid);
 // helper functions
 static inline volatile uint32_t read_arr_32le(volatile uint8_t * d, uint16_t o){
     uint32_t ret = 0;
@@ -336,14 +336,30 @@ static int nvme_rw_cmd(struct nvme_dev *nvme, uint8_t opc, uint32_t nsid,
     //     ERROR("Buffer address is not aligned to page size!\n");
     //     return -1;
     // }
-    check_block_count(nvme, lba, num_blocks);
+    check_block_count(nvme, lba, num_blocks, nsid);
     struct nvme_command cmd;
     memset(&cmd, 0, sizeof(cmd));
 
 	cmd.opc = opc;
 	cmd.nsid = htole32(nsid);
-	cmd.prp1 = (uintptr_t)buff;
-    // cmd.prp2 = (uintptr_t)(buff + NVME_PAGE_SIZE);
+    uint64_t num_pages = num_blocks*(nvme->block_size) / NVME_PAGE_SIZE; // truncates
+    // PRP (physical page region) entry = pointr to physical memory page
+    // page size configured by CC.MPS
+    cmd.prp1 = (uintptr_t)buff; // prp1 is always the value of the first PRP
+    // if data transfer fits in 1 page, leave prp2=0
+    if (num_pages == 1) {
+        // if data transfer fits in 2 pages, prp2 is the address of the second page
+        cmd.prp2 = (uintptr_t)(buff + NVME_PAGE_SIZE);
+    } else if (num_pages > 1) {
+        DEBUG("building PRP list, assuming contiguous buffer provided\n");
+        // if more than 2 pages are needed, prp2 is pointer to PRP list
+        cmd.prp2 = nvme->prp_list;
+        // build out PRP list from the provided contiguous buff
+        for (uint64_t i=1; i<num_pages; i++){
+            // address of the first page is specified in prp1, not the prp list
+            nvme->prp_list[i-1] = buff + i*NVME_PAGE_SIZE;
+        }
+    }
     cmd.cdw10 = htole32(lba & 0xffffffffu);
 	cmd.cdw11 = htole32(lba >> 32);
 	cmd.cdw12 = htole32(num_blocks-1);
@@ -449,14 +465,21 @@ int nvme_set_num_io_queues(struct nvme_dev *nvme, uint16_t num_sq, uint16_t num_
 	    0, 0, 0, 0, comp);
 }
 
-static int check_block_count(struct nvme_dev *nvme, uint64_t blocknum, uint64_t count) {
-    // check if blocknum and count are within bounds
-    if (blocknum >= nvme->num_blocks || count == 0 || (blocknum + count) > nvme->num_blocks) {
-        ERROR("Block number or count out of bounds! blocknum: %lu, count: %lu, num_blocks: %lu\n", blocknum, count, nvme->num_blocks);
+static int check_block_count(struct nvme_dev *nvme, uint64_t lba, uint64_t num_blocks, uint32_t nsid) {
+    // currently, we only know about a single namespace
+    if (nsid != nvme->ns->nsid) {
+        ERROR("Unknown nvme namespace!\n");
         return -1;
     }
-    if (count * nvme->block_size > NVME_PAGE_SIZE) {
-        ERROR("Block count * block size exceeds one page! count: %lu, block_size: %lu, mpsmin: %lu\n", count, nvme->block_size, nvme->mpsmin);
+    // check if lba and num_blocks are within bounds for a given namespace
+    uint64_t ns_block_size = 1 << nvme->ns->lbads;
+    if (lba >= nvme->ns->nsze || num_blocks == 0 || (lba + num_blocks) > nvme->ns->nsze || num_blocks > nvme->ns->nsze) {
+        ERROR("Block number or num_blocks out of bounds! lba: %lu, num_blocks: %lu, max num_blocks: %lu\n", lba, num_blocks, nvme->ns->nsze);
+        return -1;
+    }
+    uint64_t num_pages = num_blocks * ns_block_size / NVME_PAGE_SIZE; 
+    if (num_pages > (NVME_NUM_PRP + 1) ) {
+        ERROR("Number of pages spanned exceeds prp list length: num_pages: %lu, max num_pages: %lu\n", num_pages, NVME_NUM_PRP + 1);
         return -1;
     }
     // maybe need to check alignment?
@@ -558,7 +581,7 @@ int nvme_init_check_pci_cap(struct nvme_dev *state) {
         ERROR("Unsupported nvme page size. min=0x%08x; max=0x%08x; actual=0x%08x\n", mpsmin, mpsmax, NVME_PAGE_SIZE);
         return -1;
     }
-    DEBUG("Supported nvme page size. min=0x%08x; max=0x%08x; actual=0x%08x\n", mpsmin, mpsmax, NVME_PAGE_SIZE);
+    DEBUG("Supported nvme page size. min=0x%08x; max=0x%08x; actual=0x%08x=%lu\n", mpsmin, mpsmax, NVME_PAGE_SIZE, NVME_PAGE_SIZE);
     state->mpsmin = mpsmin; // need to save for use in max data transfer size calculation
     state->dstrd = (cap>>32) & 0xf;
     DEBUG("dstrd=0x%08x\n", state->dstrd);
@@ -566,7 +589,7 @@ int nvme_init_check_pci_cap(struct nvme_dev *state) {
 }
 
 // reset controller, create admin queus, set config register (cc), and start controller
-int nvme_init_controller (struct nvme_dev *state) {
+int nvme_init_controller_init (struct nvme_dev *state) {
         // Reset the controller 
         // triggered by a falling edge on the Enable bit of the controller configuration register
         volatile uint32_t cc = READ_MEM(state, NVME_CC_OFFSET);
@@ -785,7 +808,7 @@ int nk_nvme_init_register_blkdev(struct nvme_dev *state, uint16_t num) {
 // all the nvme initialization steps that are independent of nautilus or pci
 int nvme_init_nvme_setup(struct nvme_dev *state) {
     // NVME specific setup
-    if (nvme_init_controller(state)) {
+    if (nvme_init_controller_init(state)) {
         ERROR("Failed to initialize NVMe controller\n");
         return -1;
     }
@@ -950,7 +973,6 @@ int nk_nvme_init(struct naut_info *naut)
     return 0;
 }
 
-
 void nk_nvme_deinit()
 {
     INFO("deinit\n");
@@ -960,6 +982,7 @@ static int handle_nvmetest (char *buf, void *priv)
 {
     nk_vc_printf("hello from nvme test!\n");
     DEBUG("nvme state info: mdts=0x%08x, block_size=%d, num_blocks=%d, nsid=%d\n", nvme->mdts, nvme->block_size, nvme->num_blocks, nvme->ns->nsid);
+    DEBUG("\tnamespace info: nsze=%lu, ncap=%lu\n, lbads=%u, block_size=%lu", nvme->ns->nsze, nvme->ns->ncap, nvme->ns->lbads, 1 << nvme->ns->lbads);
     uint8_t id_data[4096];
     memset(id_data, 0, sizeof(id_data));
 
@@ -977,8 +1000,10 @@ static int handle_nvmetest (char *buf, void *priv)
         DEBUG("Failed Identify sanity check!\n");
         return -1;
     }
-    uint8_t *data = malloc(NVME_PAGE_SIZE);
-    memset(data, 0, NVME_PAGE_SIZE);
+    uint32_t max_num_blocks = 128;
+    uint32_t num_pages = max_num_blocks*(nvme->block_size) / NVME_PAGE_SIZE; 
+    uint8_t volatile *data = malloc(num_pages*NVME_PAGE_SIZE);
+    memset(data, 0, num_pages*NVME_PAGE_SIZE);
 
     // drive storage is persistant, so clear it first
     status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
@@ -1009,6 +1034,7 @@ static int handle_nvmetest (char *buf, void *priv)
         ERROR("Write command failed! with code 0x%08x\n", status);
         return -1;
     };
+    memset(data, 0, nvme->block_size*num_blocks);
     status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
     if (status){
         ERROR("read command failed! with code 0x%08x\n", status);
@@ -1025,7 +1051,7 @@ static int handle_nvmetest (char *buf, void *priv)
     // test writing to multiple blocks at once
     // TODO: add checks that not reading/writing beyond the end of the drive or >1 page (since rn only setting prp1)
     lba = 0; // write to the next block
-    num_blocks = 16; // write multiple blocks
+    num_blocks = 128; // write multiple blocks
     // generate and write some data
     memset(data, 0, nvme->block_size*num_blocks);
     status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
@@ -1033,6 +1059,7 @@ static int handle_nvmetest (char *buf, void *priv)
         ERROR("Write command failed! with code 0x%08x\n", status);
         return -1;
     };
+    memset(data, 0, nvme->block_size*num_blocks);
     status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
     if (status){
         ERROR("read command failed! with code 0x%08x\n", status);
@@ -1044,22 +1071,31 @@ static int handle_nvmetest (char *buf, void *priv)
             return -1;
         }
     } 
+    int j = 0;
     for (int i=0; i<nvme->block_size*num_blocks; i++){
-        data[i] = (i + 1) % 256; // start from 1
+        if (i%nvme->block_size == 0){
+            j++;
+        }
+        data[i] = (i + j) % 256; // start from block index
     }
     status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
     if (status){
         ERROR("Write command failed! with code 0x%08x\n", status);
         return -1;
     };
+    memset(data, 0, nvme->block_size*num_blocks);
     status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
     if (status){
         ERROR("read command failed! with code 0x%08x\n", status);
         return -1;
     };
+    j = 0;
     for (int i=0; i<nvme->block_size*num_blocks; i++){
-        if (data[i] != ((i + 1) % 256)){
-            ERROR("data[%d] = 0x%02x, expected 0x%02x\n", i, data[i], ((i + 1) % 256));
+        if (i%nvme->block_size == 0){
+            j++;
+        }
+        if (data[i] != (i + j) % 256){
+            ERROR("data[%d] = 0x%02x, expected 0x%02x\n", i, data[i], (i + j) % 256);
             return -1;
         }
     }    
