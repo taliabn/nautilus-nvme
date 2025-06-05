@@ -336,26 +336,29 @@ static int nvme_rw_cmd(struct nvme_dev *nvme, uint8_t opc, uint32_t nsid,
     //     ERROR("Buffer address is not aligned to page size!\n");
     //     return -1;
     // }
-    check_block_count(nvme, lba, num_blocks, nsid);
+    // if (check_block_count(nvme, lba, num_blocks, nsid)){
+        // return -1;
+    // }
+
     struct nvme_command cmd;
     memset(&cmd, 0, sizeof(cmd));
 
 	cmd.opc = opc;
 	cmd.nsid = htole32(nsid);
-    uint64_t num_pages = num_blocks*(nvme->block_size) / NVME_PAGE_SIZE; // truncates
+    uint64_t num_extra_pages = num_blocks*(nvme->block_size) / NVME_PAGE_SIZE; // truncates
     // PRP (physical page region) entry = pointr to physical memory page
     // page size configured by CC.MPS
     cmd.prp1 = (uintptr_t)buff; // prp1 is always the value of the first PRP
     // if data transfer fits in 1 page, leave prp2=0
-    if (num_pages == 1) {
+    if (num_extra_pages == 1) {
         // if data transfer fits in 2 pages, prp2 is the address of the second page
         cmd.prp2 = (uintptr_t)(buff + NVME_PAGE_SIZE);
-    } else if (num_pages > 1) {
+    } else if (num_extra_pages > 1) {
         DEBUG("building PRP list, assuming contiguous buffer provided\n");
         // if more than 2 pages are needed, prp2 is pointer to PRP list
         cmd.prp2 = nvme->prp_list;
         // build out PRP list from the provided contiguous buff
-        for (uint64_t i=1; i<num_pages; i++){
+        for (uint64_t i=1; i<num_extra_pages; i++){
             // address of the first page is specified in prp1, not the prp list
             nvme->prp_list[i-1] = buff + i*NVME_PAGE_SIZE;
         }
@@ -980,15 +983,22 @@ void nk_nvme_deinit()
 
 static int handle_nvmetest (char *buf, void *priv)
 {
-    nk_vc_printf("hello from nvme test!\n");
-    DEBUG("nvme state info: mdts=0x%08x, block_size=%d, num_blocks=%d, nsid=%d\n", nvme->mdts, nvme->block_size, nvme->num_blocks, nvme->ns->nsid);
-    DEBUG("\tnamespace info: nsze=%lu, ncap=%lu\n, lbads=%u, block_size=%lu", nvme->ns->nsze, nvme->ns->ncap, nvme->ns->lbads, 1 << nvme->ns->lbads);
-    uint8_t id_data[4096];
-    memset(id_data, 0, sizeof(id_data));
-
-    struct nvme_completion comp;
+    // arguments: starting block, total number of blocks
     uint64_t lba = 0;
     uint32_t num_blocks = 1;
+    if (sscanf(buf, "nvmetest %lu %u", &lba, &num_blocks) != 2) { 
+        nk_vc_printf("Usage: nvmetest start_block num_blocks",buf);
+        return -1;
+    }
+
+    // print some info about the controller/namespace
+    DEBUG("nvme state info: mdts=0x%08x, block_size=%d, num_blocks=%d, nsid=%d\n", nvme->mdts, nvme->block_size, nvme->num_blocks, nvme->ns->nsid);
+    DEBUG("\tnamespace info: nsze=%lu, ncap=%lu\n, lbads=%u, block_size=%lu", nvme->ns->nsze, nvme->ns->ncap, nvme->ns->lbads, 1 << nvme->ns->lbads);
+
+    // send an Identify command to make sure the basics are working
+    uint8_t id_data[4096];
+    memset(id_data, 0, sizeof(id_data));
+    struct nvme_completion comp;
     int status;
     if (nvme_identify_controller_cmd(nvme, id_data, &comp)){
         ERROR("Identify controller command failed\n");
@@ -1000,93 +1010,31 @@ static int handle_nvmetest (char *buf, void *priv)
         DEBUG("Failed Identify sanity check!\n");
         return -1;
     }
-    uint32_t max_num_blocks = 128;
-    uint32_t num_pages = max_num_blocks*(nvme->block_size) / NVME_PAGE_SIZE; 
-    uint8_t volatile *data = malloc(num_pages*NVME_PAGE_SIZE);
+
+    // allocate buffer for read/write data 
+    uint32_t num_pages = 1 + (num_blocks*(nvme->block_size) / NVME_PAGE_SIZE); 
+    uint8_t *data = malloc(num_pages*NVME_PAGE_SIZE);
     memset(data, 0, num_pages*NVME_PAGE_SIZE);
 
-    // drive storage is persistant, so clear it first
-    status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
-    if (status){
-        ERROR("Write command failed! with code 0x%08x\n", status);
-        return -1;
-    };
-    // read back what should be zeros
-    status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
-    if (status){
-        ERROR("read command failed! with code 0x%08x\n", status);
-        return -1;
-    };
-    for (int i=0; i<nvme->block_size; i++){
-        if (data[i] != 0){
-            ERROR("data[%d] = 0x%02x, expected 0\n", i, data[i]);
-            return -1;
-        }
-    }
-    DEBUG("PASSED WRITE + READ ZERO TEST\n");
-
     // generate and write some data
-    for (int i=0; i<nvme->block_size; i++){
-        data[i] = i % 256;
-    }
-    status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
-    if (status){
-        ERROR("Write command failed! with code 0x%08x\n", status);
-        return -1;
-    };
-    memset(data, 0, nvme->block_size*num_blocks);
-    status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
-    if (status){
-        ERROR("read command failed! with code 0x%08x\n", status);
-        return -1;
-    };
-    for (int i=0; i<nvme->block_size; i++){
-        if (data[i] != (i % 256)){
-            ERROR("data[%d] = 0x%02x, expected 0x%02x\n", i, data[i], (i % 256));
-            return -1;
-        }
-    }
-    DEBUG("PASSED WRITE + READ DATA TEST\n");
-
-    // test writing to multiple blocks at once
-    // TODO: add checks that not reading/writing beyond the end of the drive or >1 page (since rn only setting prp1)
-    lba = 0; // write to the next block
-    num_blocks = 128; // write multiple blocks
-    // generate and write some data
-    memset(data, 0, nvme->block_size*num_blocks);
-    status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
-    if (status){
-        ERROR("Write command failed! with code 0x%08x\n", status);
-        return -1;
-    };
-    memset(data, 0, nvme->block_size*num_blocks);
-    status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
-    if (status){
-        ERROR("read command failed! with code 0x%08x\n", status);
-        return -1;
-    };
-    for (int i=0; i<nvme->block_size*num_blocks; i++){
-        if (data[i] != 0){
-            ERROR("data[%d] = 0x%02x, expected 0x%02x\n", i, data[i], 0);
-            return -1;
-        }
-    } 
     int j = 0;
     for (int i=0; i<nvme->block_size*num_blocks; i++){
         if (i%nvme->block_size == 0){
             j++;
         }
-        data[i] = (i + j) % 256; // start from block index
+        data[i] = (i + j) % 256; // offset by block address
     }
     status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
     if (status){
         ERROR("Write command failed! with code 0x%08x\n", status);
         return -1;
     };
-    memset(data, 0, nvme->block_size*num_blocks);
+
+    // read back the data to make sure it matches
+    memset(data, 0, num_pages*NVME_PAGE_SIZE);
     status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
     if (status){
-        ERROR("read command failed! with code 0x%08x\n", status);
+        ERROR("Read command failed! with code 0x%08x\n", status);
         return -1;
     };
     j = 0;
@@ -1098,8 +1046,9 @@ static int handle_nvmetest (char *buf, void *priv)
             ERROR("data[%d] = 0x%02x, expected 0x%02x\n", i, data[i], (i + j) % 256);
             return -1;
         }
-    }    
-    DEBUG("PASSED WRITE + READ MULTIPLE BLOCKS TEST\n");
+    }
+    free(data);
+    nk_vc_printf("PASSED NVME TEST\n");
     return 0;
 }
 
