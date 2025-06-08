@@ -69,12 +69,12 @@ struct nvme_queue {
 
 typedef struct nvme_sq {
     struct nvme_queue q;
-    struct nvme_command buffer[];
+    struct nvme_command* buffer;
 } nvme_sq;
 
 typedef struct nvme_cq {
     struct nvme_queue q;
-    struct nvme_completion buffer[];
+    struct nvme_completion* buffer;
 } nvme_cq;
 
 
@@ -149,18 +149,18 @@ static int check_csts_fatal_status(struct nvme_dev *nvme){
 // Queues
 
 int create_admin_submission_queue(struct nvme_dev *nvme) {
-    nvme_sq *sq = (nvme_sq*)malloc(sizeof(nvme_sq) + (NVME_ASQS * sizeof(struct nvme_command)));
-    if (sq==NULL){
-        ERROR("Couldn't malloc admin sq\n");
+    nvme_sq* sq = &nvme->admin_sq;
+    sq->q.size = NVME_ASQS;
+    sq->buffer = (struct nvme_command*)malloc(NVME_PAGE_SIZE);
+    if (sq->buffer == NULL) {
+        ERROR("Couldn't malloc admin sq buffer\n");
         return -1;
     }
-    sq->q.size = NVME_ASQS;
     DEBUG("created ring buffer\n");
-    sq->q.addr = &sq->buffer;
+    sq->q.addr = sq->buffer;
     sq->q.id = 0; // admin queues SHALL have id 0
     sq->q.tail = 0;
     sq->q.head = 0;
-    nvme->admin_sq = *sq;
     DEBUG("admin_sq addr: 0x%lx\n", nvme->admin_sq.q.addr);
     // Bottom 12 bits of address MUST be 0!
     if (nvme->admin_sq.q.addr & 0xfff) {
@@ -176,23 +176,23 @@ int create_admin_submission_queue(struct nvme_dev *nvme) {
 }
 
 int create_admin_completion_queue(struct nvme_dev *nvme) {
-    nvme_cq *cq = (nvme_cq*)malloc(sizeof(nvme_cq) + (NVME_ACQS * sizeof(struct nvme_completion)));
-    if (cq==NULL){
-        ERROR("Couldn't malloc admin cq\n");
+    nvme_cq *cq = &nvme->admin_cq;
+    cq->q.size = NVME_ACQS;
+    cq->buffer = (struct nvme_completion*)malloc(NVME_PAGE_SIZE); // sizeof(struct nvme_completion) * (cq->q.size + 1)?
+    if (cq->buffer==NULL){
+        ERROR("Couldn't malloc admin cq buffer\n");
         return -1;
     }
-    cq->q.size = NVME_ACQS;
-    cq->q.addr = &cq->buffer;
+    cq->q.addr = cq->buffer;
     cq->q.id = 0; // admin queues SHALL have id 0
     cq->q.tail = 0;
     cq->q.head = 0;
-    nvme->admin_cq = *cq;
     DEBUG("admin_cq addr: 0x%lx\n", nvme->admin_cq.q.addr);
     // The Phase Tag values for all Completion Queue entries shall be initialized to 0
     memset(nvme->admin_cq.q.addr, 0, (cq->q.size+1) * sizeof(struct nvme_completion));
     // Bottom 12 bits of address MUST be 0!
     if (nvme->admin_cq.q.addr & 0xfff) {
-        ERROR("Admin submission queue address is not 12-bit aligned!\n");
+        ERROR("Admin completion queue address is not 12-bit aligned!\n");
         return -1;
     }
 	WRITE_MEM(nvme, NVME_ACQ_OFFSET,nvme->admin_cq.q.addr);
@@ -662,13 +662,13 @@ int nvme_init_create_and_configure_io_queues (struct nvme_dev *state) {
             return -1;
         }
         // Create the first IO completion queue, and the first IO submission queue.
-        nvme_cq *cq = (nvme_cq*)malloc(sizeof(nvme_cq) + (sizeof(struct nvme_completion) * 63)); // FIX
+        nvme_cq *cq = (nvme_cq*)malloc(sizeof(nvme_cq)); // FIX
         if (cq==NULL){
             ERROR("Couldn't malloc io cq\n");
             return -1;
         }
         state->io_cq = *cq;
-        nvme_sq *sq = (nvme_sq*)malloc(sizeof(nvme_sq) + (sizeof(struct nvme_command) * 63)); // FIX
+        nvme_sq *sq = (nvme_sq*)malloc(sizeof(nvme_sq)); // FIX
         if (sq==NULL){
             ERROR("Couldn't malloc io sq\n");
             return -1;
@@ -980,6 +980,7 @@ static int handle_nvmetest (char *buf, void *priv)
     // arguments: starting block, total number of blocks
     uint64_t lba = 0;
     uint32_t num_blocks = 1;
+
     if (sscanf(buf, "nvmetest %lu %u", &lba, &num_blocks) != 2) { 
         nk_vc_printf("Usage: nvmetest start_block num_blocks",buf);
         return -1;
@@ -1021,6 +1022,7 @@ static int handle_nvmetest (char *buf, void *priv)
     status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
     if (status){
         ERROR("Write command failed! with code 0x%08x\n", status);
+        free(data);
         return -1;
     };
 
@@ -1029,6 +1031,7 @@ static int handle_nvmetest (char *buf, void *priv)
     status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
     if (status){
         ERROR("Read command failed! with code 0x%08x\n", status);
+        free(data);
         return -1;
     };
     j = 0;
@@ -1038,6 +1041,7 @@ static int handle_nvmetest (char *buf, void *priv)
         }
         if (data[i] != (i + j) % 256){
             ERROR("data[%d] = 0x%02x, expected 0x%02x\n", i, data[i], (i + j) % 256);
+            free(data);
             return -1;
         }
     }
