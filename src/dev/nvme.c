@@ -34,7 +34,9 @@
 #include <nautilus/shell.h>
 #include <nautilus/dev.h>
 #include <nautilus/endian.h>
-#include <nautilus/ringbuffer.h>
+#include <nautilus/semaphore.h>
+#include <nautilus/spinlock.h>
+
 
 #ifndef NAUT_CONFIG_DEBUG_NVME
 #undef DEBUG_PRINT
@@ -55,17 +57,25 @@
 
 // types
 struct nvme_queue {
+    struct nk_semaphore *slots_free_write;
+    struct nk_semaphore *slots_free_read;
+    spinlock_t lock;
     uint64_t addr;
     uint64_t size;
     uint16_t id;
     uint16_t tail;
     uint16_t head;
-    struct ring_buffer *ring_buff;
 };
 
-typedef struct nvme_queue nvme_sq;
+typedef struct nvme_sq {
+    struct nvme_queue q;
+    struct nvme_command buffer[];
+} nvme_sq;
 
-typedef struct nvme_queue nvme_cq;
+typedef struct nvme_cq {
+    struct nvme_queue q;
+    struct nvme_completion buffer[];
+} nvme_cq;
 
 
 struct nvme_dev {
@@ -94,8 +104,8 @@ struct nvme_dev {
     // stats?
     uint16_t q_id;
     // Where registers are mapped into the physical memory address space
-    uint64_t  mem_start;
-    uint64_t  mem_end;
+    uint64_t mem_start;
+    uint64_t mem_end;
     uint32_t mpsmin;
     uint8_t mdts; // max data transfer size (in units of the minimum memory page size and reported as a power of two )
 };
@@ -139,29 +149,25 @@ static int check_csts_fatal_status(struct nvme_dev *nvme){
 // Queues
 
 int create_admin_submission_queue(struct nvme_dev *nvme) {
-    nvme_sq *sq = (nvme_sq*)malloc(sizeof(nvme_sq));
+    nvme_sq *sq = (nvme_sq*)malloc(sizeof(nvme_sq) + (NVME_ASQS * sizeof(struct nvme_command)));
     if (sq==NULL){
         ERROR("Couldn't malloc admin sq\n");
         return -1;
     }
-    sq->size = NVME_ASQS;
-    sq->ring_buff = create_ring_buffer(sq->size + 1, sizeof(struct nvme_command));
-    if (sq->ring_buff==NULL) { // malloc failed
-        return -1;
-    }
+    sq->q.size = NVME_ASQS;
     DEBUG("created ring buffer\n");
-    sq->addr = sq->ring_buff->buffer;
-    sq->id = 0; // admin queues SHALL have id 0
-    sq->tail = 0;
-    sq->head = 0;
+    sq->q.addr = &sq->buffer;
+    sq->q.id = 0; // admin queues SHALL have id 0
+    sq->q.tail = 0;
+    sq->q.head = 0;
     nvme->admin_sq = *sq;
-    DEBUG("admin_sq addr: 0x%lx\n", nvme->admin_sq.addr);
+    DEBUG("admin_sq addr: 0x%lx\n", nvme->admin_sq.q.addr);
     // Bottom 12 bits of address MUST be 0!
-    if (nvme->admin_sq.addr & 0xfff) {
+    if (nvme->admin_sq.q.addr & 0xfff) {
         ERROR("Admin submission queue address is not 12-bit aligned!\n");
         return -1;
     }
-	WRITE_MEM(nvme, NVME_ASQ_OFFSET, nvme->admin_sq.addr);
+	WRITE_MEM(nvme, NVME_ASQ_OFFSET, nvme->admin_sq.q.addr);
     // write admin submission queue size to Admin Queue Attributes (AQA) register
     volatile uint32_t aqa = READ_MEM(nvme, NVME_AQA_OFFSET);
     aqa |= NVME_ASQS;
@@ -170,30 +176,26 @@ int create_admin_submission_queue(struct nvme_dev *nvme) {
 }
 
 int create_admin_completion_queue(struct nvme_dev *nvme) {
-    nvme_cq *cq = (nvme_cq*)malloc(sizeof(nvme_cq));
+    nvme_cq *cq = (nvme_cq*)malloc(sizeof(nvme_cq) + (NVME_ACQS * sizeof(struct nvme_completion)));
     if (cq==NULL){
         ERROR("Couldn't malloc admin cq\n");
         return -1;
     }
-    cq->size = NVME_ACQS;
-    cq->ring_buff = create_ring_buffer(cq->size + 1, sizeof(struct nvme_completion));
-    if (cq->ring_buff==NULL) { // malloc failed
-        return -1;
-    }
-    cq->addr = cq->ring_buff->buffer;
-    cq->id = 0; // admin queues SHALL have id 0
-    cq->tail = 0;
-    cq->head = 0;
+    cq->q.size = NVME_ACQS;
+    cq->q.addr = &cq->buffer;
+    cq->q.id = 0; // admin queues SHALL have id 0
+    cq->q.tail = 0;
+    cq->q.head = 0;
     nvme->admin_cq = *cq;
-    DEBUG("admin_cq addr: 0x%lx\n", nvme->admin_cq.addr);
+    DEBUG("admin_cq addr: 0x%lx\n", nvme->admin_cq.q.addr);
     // The Phase Tag values for all Completion Queue entries shall be initialized to 0
-    memset(nvme->admin_cq.addr, 0, (cq->size+1) * sizeof(struct nvme_completion));
+    memset(nvme->admin_cq.q.addr, 0, (cq->q.size+1) * sizeof(struct nvme_completion));
     // Bottom 12 bits of address MUST be 0!
-    if (nvme->admin_cq.addr & 0xfff) {
+    if (nvme->admin_cq.q.addr & 0xfff) {
         ERROR("Admin submission queue address is not 12-bit aligned!\n");
         return -1;
     }
-	WRITE_MEM(nvme, NVME_ACQ_OFFSET,nvme->admin_cq.addr);
+	WRITE_MEM(nvme, NVME_ACQ_OFFSET,nvme->admin_cq.q.addr);
     // write admin completion queue size to Admin Queue Attributes (AQA) register
     volatile uint32_t aqa = READ_MEM(nvme, NVME_AQA_OFFSET);
     aqa |= NVME_ACQS << 16;
@@ -202,47 +204,39 @@ int create_admin_completion_queue(struct nvme_dev *nvme) {
 }
 
 int create_io_submission_queue(struct nvme_dev *nvme, nvme_sq *sq) {
-	sq->size = 63;
-    sq->ring_buff = create_ring_buffer(sq->size + 1, sizeof(struct nvme_command));
-    if (sq->ring_buff==NULL) { // malloc failed
-        return -1;
-    }
-    sq->addr = sq->ring_buff->buffer;
-    DEBUG("io_sq addr: 0x%lx\n", sq->addr);
-    if (sq->addr & 0xfff) {
+	sq->q.size = 63;
+    sq->q.addr = sq->buffer;
+    DEBUG("io_sq addr: 0x%lx\n", sq->q.addr);
+    if (sq->q.addr & 0xfff) {
         ERROR("IO submission queue address is not 12-bit aligned!\n");
         return -1;
     }
     // io queues will arbitrarily have id=1 (can't be 0 because that is reserved for admin queues)
     uint16_t sq_id = 1;
     uint16_t cq_id = 1;
-    sq->id = sq_id;
-    sq->tail = 0;
-    sq->head = 0;
+    sq->q.id = sq_id;
+    sq->q.tail = 0;
+    sq->q.head = 0;
     struct nvme_completion comp;
 	return nvme_create_io_sq_cmd(nvme, sq_id, cq_id, sq, &comp);
 }
 
 int create_io_completion_queue(struct nvme_dev *nvme, nvme_cq *cq) {
-	cq->size = 63;
-    cq->ring_buff = create_ring_buffer(cq->size + 1, sizeof(struct nvme_completion));
-    if (cq->ring_buff==NULL) { // malloc failed
-        return -1;
-    }
-    cq->addr = cq->ring_buff->buffer;
+	cq->q.size = 63;
+    cq->q.addr = cq->buffer;
     // The address pointer is memory page aligned (based on the value in CC.MPS) unless otherwise specified
-    DEBUG("io_cq addr: 0x%lx\n", cq->addr);
-    if (cq->addr & 0xfff) {
+    DEBUG("io_cq addr: 0x%lx\n", cq->q.addr);
+    if (cq->q.addr & 0xfff) {
         ERROR("IO completion queue address is not 12-bit aligned!\n");
         return -1;
     }
     // The Phase Tag values for all Completion Queue entries shall be initialized to 0
-    memset(cq->addr, 0, (cq->size+1) * sizeof(struct nvme_completion));
+    memset(cq->q.addr, 0, (cq->q.size+1) * sizeof(struct nvme_completion));
     // io queues will arbitrarily have id=1 (can't be 0 because that is reserved for admin queues)
     uint16_t cq_id = 1;
-    cq->id = cq_id;
-    cq->tail = 0;
-    cq->head = 0;
+    cq->q.id = cq_id;
+    cq->q.tail = 0;
+    cq->q.head = 0;
     struct nvme_completion comp;
 	return nvme_create_io_cq_cmd(nvme, cq_id, cq, &comp);
 }
@@ -250,22 +244,22 @@ int create_io_completion_queue(struct nvme_dev *nvme, nvme_cq *cq) {
 
 /* Command submisison helper functions */
 
-static int nvme_queue_submit_cmd(struct nvme_dev *nvme, struct nvme_queue *sq, struct nvme_queue *cq, struct nvme_command *cmd, struct nvme_completion *comp){
+static int nvme_queue_submit_cmd(struct nvme_dev *nvme, nvme_sq *sq, struct nvme_cq *cq, struct nvme_command *cmd, struct nvme_completion *comp){
     // physical memory addresses in queues to access
-    volatile struct nvme_command *sq_entry = sq->addr + (sq->tail * sizeof(struct nvme_command));
-    volatile struct nvme_completion *cq_entry = cq->addr + (cq->head * sizeof(struct nvme_completion));  
+    volatile struct nvme_command *sq_entry = sq->q.addr + (sq->q.tail * sizeof(struct nvme_command));
+    volatile struct nvme_completion *cq_entry = cq->q.addr + (cq->q.head * sizeof(struct nvme_completion));  
     // DEBUG("sq_entry: 0x%lx\n", sq_entry);
     // DEBUG("cq_entry: 0x%lx\n", cq_entry);
 
-    uint16_t sq_tail_doorbell = 0x1000 + ((2*sq->id) * (4 << nvme->dstrd));    
+    uint16_t sq_tail_doorbell = 0x1000 + ((2*sq->q.id) * (4 << nvme->dstrd));    
     // enqueue command in submission queue
-	sq->tail++;
-    if (sq->head == sq->tail + 1){
+	sq->q.tail++;
+    if (sq->q.head == sq->q.tail + 1){
         ERROR("Submission queue is full!\n");
         return -1;
     }
-	if (sq->tail == (sq->size + 1)){
-        sq->tail = 0; // wrap
+	if (sq->q.tail == (sq->q.size + 1)){
+        sq->q.tail = 0; // wrap
     }
     // DEBUG("sq->tail: %d\n", sq->tail);
     volatile uint8_t prev_phase_tag = cq_entry->phase_tag;
@@ -274,7 +268,7 @@ static int nvme_queue_submit_cmd(struct nvme_dev *nvme, struct nvme_queue *sq, s
     // ring submission queue doorbell by writing address to register
     // tail should be the index of the next *free* slot, not the one we just wrote to
     // DEBUG("cq_entry->phase_tag: %d\n", cq_entry->phase_tag);
-    WRITE_MEM(nvme, sq_tail_doorbell, sq->tail);
+    WRITE_MEM(nvme, sq_tail_doorbell, sq->q.tail);
     // DEBUG("waiting for command to be processed\n");
     // poll
     // hardware will invert phase tag bit upon every write to cq
@@ -294,14 +288,14 @@ static int nvme_queue_submit_cmd(struct nvme_dev *nvme, struct nvme_queue *sq, s
     };
     // DEBUG("cq_entry->phase_tag: %d\n", cq_entry->phase_tag);
     // DEBUG("command processed\n");
-    uint16_t cq_head_doorbell = 0x1000 + (((2*cq->id) + 1) * (4 << nvme->dstrd));
+    uint16_t cq_head_doorbell = 0x1000 + (((2*cq->q.id) + 1) * (4 << nvme->dstrd));
     // dequeue completion from completion queue
-    cq->head++;
-	if (cq->head == (cq->size + 1)){
-        cq->head = 0; // wrap
+    cq->q.head++;
+	if (cq->q.head == (cq->q.size + 1)){
+        cq->q.head = 0; // wrap
     }
     // controller tells us where the new sq head is depending on how many entries it has consumed
-    sq->head = cq_entry->sq_head;  
+    sq->q.head = cq_entry->sq_head;  
     // DEBUG("sq->head: %d\n", cq->head);
     // DEBUG("cq->head: %d\n", cq->head);
     // NOTE: *don't* overwrite consumed sq or cq entry or else undefined "hw" behavior
@@ -310,7 +304,7 @@ static int nvme_queue_submit_cmd(struct nvme_dev *nvme, struct nvme_queue *sq, s
     memcpy((void*)comp, (void*)cq_entry, sizeof(struct nvme_completion));
     // DEBUG("read from cq_entry: 0x%lx\n", cq_entry);
     // ring completion queue doorbell by writing address to register
-    WRITE_MEM(nvme, cq_head_doorbell, cq->head);
+    WRITE_MEM(nvme, cq_head_doorbell, cq->q.head);
     // DEBUG("wrote to cq_head_doorbell\n");
     // DEBUG("sq->tail: %d, sq->head: %d, cq->head: %d\n", sq->tail, sq->head, cq->head);
     DEBUG("command completed with status: 0x%08x and took %d ticks\n", comp->status, i);
@@ -421,8 +415,8 @@ int nvme_create_io_sq_cmd(struct nvme_dev *nvme, uint16_t sq_id, uint16_t cq_id,
     memset(&cmd, 0, sizeof(cmd));
 
 	cmd.opc = NVME_OPC_CREATE_IO_SQ;
-	cmd.prp1 = htole64(io_sq->addr);
-	cmd.cdw10 = htole32(((io_sq->size) << 16) | sq_id);
+	cmd.prp1 = htole64(io_sq->q.addr);
+	cmd.cdw10 = htole32(((io_sq->q.size) << 16) | sq_id);
 	cmd.cdw11 = htole32((cq_id << 16) | 0x01);
     
     return nvme_submit_admin_cmd(nvme, &cmd, comp); 
@@ -433,8 +427,8 @@ int nvme_create_io_cq_cmd(struct nvme_dev *nvme, uint16_t cq_id, nvme_cq *io_cq,
     memset(&cmd, 0, sizeof(cmd));
 
 	cmd.opc = NVME_OPC_CREATE_IO_CQ;
-	cmd.prp1 = htole64(io_cq->addr);
-	cmd.cdw10 = htole32(((io_cq->size) << 16) | cq_id);
+	cmd.prp1 = htole64(io_cq->q.addr);
+	cmd.cdw10 = htole32(((io_cq->q.size) << 16) | cq_id);
     // if we were using interrupts, specify MSI vector + 1 in highword of DWORD11
 	/* flags 0x1 = interrupts not enabled, physically contiguous */
 	cmd.cdw11 = htole32(0x01);
@@ -668,13 +662,13 @@ int nvme_init_create_and_configure_io_queues (struct nvme_dev *state) {
             return -1;
         }
         // Create the first IO completion queue, and the first IO submission queue.
-        nvme_cq *cq = (nvme_cq*)malloc(sizeof(nvme_cq));
+        nvme_cq *cq = (nvme_cq*)malloc(sizeof(nvme_cq) + (sizeof(struct nvme_completion) * 63)); // FIX
         if (cq==NULL){
             ERROR("Couldn't malloc io cq\n");
             return -1;
         }
         state->io_cq = *cq;
-        nvme_sq *sq = (nvme_sq*)malloc(sizeof(nvme_sq));
+        nvme_sq *sq = (nvme_sq*)malloc(sizeof(nvme_sq) + (sizeof(struct nvme_command) * 63)); // FIX
         if (sq==NULL){
             ERROR("Couldn't malloc io sq\n");
             return -1;
@@ -972,7 +966,7 @@ int nk_nvme_init(struct naut_info *naut)
         }
     }
     // TODO: how to store state better than this?
-    nvme = state;
+    nvme = state; // im sus of this
     return 0;
 }
 
