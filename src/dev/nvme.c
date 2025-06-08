@@ -113,7 +113,6 @@ struct nvme_dev {
 // static variables
 // list of discovered devices
 static struct list_head dev_list;
-static struct nvme_dev* nvme;
 
 // forward declarations:
 int nvme_create_io_sq_cmd(struct nvme_dev *nvme, uint16_t sq_id, uint16_t cq_id, nvme_sq *io_sq, struct nvme_completion *comp);
@@ -150,6 +149,7 @@ static int check_csts_fatal_status(struct nvme_dev *nvme){
 
 int create_admin_submission_queue(struct nvme_dev *nvme) {
     nvme_sq* sq = &nvme->admin_sq;
+    //nk_semaphore_create(sq->q.slots_free_write, sq->q.size+1, 0, 0);
     sq->q.size = NVME_ASQS;
     sq->buffer = (struct nvme_command*)malloc(NVME_PAGE_SIZE);
     if (sq->buffer == NULL) {
@@ -488,7 +488,7 @@ static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *
     // TODO: locks or something
     struct nvme_dev *s = (struct nvme_dev *)state;
     struct nvme_completion comp;
-    int nvme_status = nvme_read_cmd(nvme, nvme->ns->nsid, dest, blocknum, count, &comp);
+    int nvme_status = nvme_read_cmd(s, s->ns->nsid, dest, blocknum, count, &comp);
     nk_block_dev_status_t blk_dev_status;
 
     if (nvme_status){
@@ -512,7 +512,7 @@ static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t 
     // TODO: locks or something
     struct nvme_dev *s = (struct nvme_dev *)state;
     struct nvme_completion comp;
-    int nvme_status = nvme_write_cmd(nvme, nvme->ns->nsid, src, blocknum, count, &comp);
+    int nvme_status = nvme_write_cmd(s, s->ns->nsid, src, blocknum, count, &comp);
     nk_block_dev_status_t blk_dev_status;
 
     if (nvme_status){
@@ -965,8 +965,6 @@ int nk_nvme_init(struct naut_info *naut)
             }
         }
     }
-    // TODO: how to store state better than this?
-    nvme = state; // im sus of this
     return 0;
 }
 
@@ -978,48 +976,42 @@ void nk_nvme_deinit()
 static int handle_nvmetest (char *buf, void *priv)
 {
     // arguments: starting block, total number of blocks
-    uint64_t lba = 0;
-    uint32_t num_blocks = 1;
+    uint64_t start = 0;
+    uint32_t count = 1;
+    struct nk_block_dev *d;
+    struct nk_block_dev_characteristics c;
 
-    if (sscanf(buf, "nvmetest %lu %u", &lba, &num_blocks) != 2) { 
-        nk_vc_printf("Usage: nvmetest start_block num_blocks",buf);
+    if (sscanf(buf, "nvmetest %lu %u", &start, &count) != 2) {
+        nk_vc_printf("Usage: nvmetest start_block count\n");
         return -1;
     }
 
-    // print some info about the controller/namespace
-    DEBUG("nvme state info: mdts=0x%08x, block_size=%d, num_blocks=%d, nsid=%d\n", nvme->mdts, nvme->block_size, nvme->num_blocks, nvme->ns->nsid);
-    DEBUG("\tnamespace info: nsze=%lu, ncap=%lu\n, lbads=%u, block_size=%lu", nvme->ns->nsze, nvme->ns->ncap, nvme->ns->lbads, 1 << nvme->ns->lbads);
-
-    // send an Identify command to make sure the basics are working
-    uint8_t id_data[4096];
-    memset(id_data, 0, sizeof(id_data));
-    struct nvme_completion comp;
-    int status;
-    if (nvme_identify_controller_cmd(nvme, id_data, &comp)){
-        ERROR("Identify controller command failed\n");
-        return -1;
-    };
-    // sanity check minimum queue entry sizes
-    // min sqes and min cqes should be 6 and 4 respectively
-    if ((id_data[512]&0xf)!=0x6 || (id_data[513]&0xf)!=0x4){
-        DEBUG("Failed Identify sanity check!\n");
+    if (!(d=nk_block_dev_find("nvme-0"))) {
+        nk_vc_printf("Can't find nvme-0\n");
         return -1;
     }
 
-    // allocate buffer for read/write data 
-    uint32_t num_pages = 1 + (num_blocks*(nvme->block_size) / NVME_PAGE_SIZE); 
+    if (nk_block_dev_get_characteristics(d, &c)) {
+        nk_vc_printf("Can't get characteristics of nvme-0\n");
+        return -1;
+    }
+
+    nk_vc_printf("nvme block_size=%lu, num_blocks=%lu\n", c.block_size, c.num_blocks);
+
+    // allocate buffer for read/write data
+    uint32_t num_pages = 1 + (count*(c.block_size) / NVME_PAGE_SIZE);
     uint8_t *data = malloc(num_pages*NVME_PAGE_SIZE);
     memset(data, 0, num_pages*NVME_PAGE_SIZE);
 
     // generate and write some data
     int j = 0;
-    for (int i=0; i<nvme->block_size*num_blocks; i++){
-        if (i%nvme->block_size == 0){
+    for (int i=0; i< c.block_size*count; i++){
+        if (i % c.block_size == 0){
             j++;
         }
         data[i] = (i + j) % 256; // offset by block address
     }
-    status = nvme_write_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
+    int status = nk_block_dev_write(d, start, count, data, NK_DEV_REQ_BLOCKING, NULL, NULL);
     if (status){
         ERROR("Write command failed! with code 0x%08x\n", status);
         free(data);
@@ -1028,15 +1020,15 @@ static int handle_nvmetest (char *buf, void *priv)
 
     // read back the data to make sure it matches
     memset(data, 0, num_pages*NVME_PAGE_SIZE);
-    status = nvme_read_cmd(nvme, nvme->ns->nsid, data, lba, num_blocks, &comp);
+    status = nk_block_dev_read(d, start, count, data, NK_DEV_REQ_BLOCKING, NULL, NULL);
     if (status){
         ERROR("Read command failed! with code 0x%08x\n", status);
         free(data);
         return -1;
     };
     j = 0;
-    for (int i=0; i<nvme->block_size*num_blocks; i++){
-        if (i%nvme->block_size == 0){
+    for (int i=0; i<c.block_size*count; i++){
+        if (i%c.block_size == 0){
             j++;
         }
         if (data[i] != (i + j) % 256){
