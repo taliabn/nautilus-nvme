@@ -75,9 +75,6 @@ void nk_nvme_deinit();
 #define NVME_ASQS 63 // Admin Submission Queue Size
 // for nvme get/set feature commands
 #define NVME_FEAT_NUMBER_OF_QUEUES 0x07
-// size of physical regio page (PRP) list
-// determines how many pages of data can be transferred at once
-#define NVME_NUM_PRP 512 // max pages is actually one more, specify address of first page elsewhere
 /* NVMe types */
 
 
