@@ -84,25 +84,15 @@ struct nvme_dev {
     // pci interrupt and interupt vector
     struct pci_dev *pci_dev;
     struct nk_block_dev *blkdev;
-    enum {NONE=0, HD, CD} type;
     uint64_t block_size;
     uint64_t num_blocks;
-    char* pci_addr;
-    uint8_t* addr;
-    int len;
     uint32_t dstrd;
     nvme_sq admin_sq;
     nvme_cq admin_cq;
     nvme_sq io_sq; // For now 1
     nvme_cq io_cq; // For now 1
-    uint8_t buffer; // Suggets 2 MiB buffer, but probably unnecesary since Nautilus doesn't page
     uint64_t prp_list[NVME_NUM_PRP]; // physical region page list
-    uint32_t* namespaces; // For now empty, can implement as linked list
-    // ^^ probably want to use the pre-existing nautilus linked list implementation
-    // for now let's have a struct with a single namespace
-    struct nvme_namespace *ns;
-    // stats?
-    uint16_t q_id;
+    struct nvme_namespace *ns; // for now let's have a struct with a single namespace
     // Where registers are mapped into the physical memory address space
     uint64_t mem_start;
     uint64_t mem_end;
@@ -149,7 +139,13 @@ static int check_csts_fatal_status(struct nvme_dev *nvme){
 
 int create_admin_submission_queue(struct nvme_dev *nvme) {
     nvme_sq* sq = &nvme->admin_sq;
-    //nk_semaphore_create(sq->q.slots_free_write, sq->q.size+1, 0, 0);
+
+    sq->q.slots_free_write = nk_semaphore_create(0, sq->q.size + 1, 0, 0);
+    nk_semaphore_init(sq->q.slots_free_write);
+    sq->q.slots_free_read = nk_semaphore_create(0, 0, 0, 0);
+    nk_semaphore_init(sq->q.slots_free_read);
+    spinlock_init(&sq->q.lock);
+
     sq->q.size = NVME_ASQS;
     sq->buffer = (struct nvme_command*)malloc(NVME_PAGE_SIZE);
     if (sq->buffer == NULL) {
@@ -177,6 +173,13 @@ int create_admin_submission_queue(struct nvme_dev *nvme) {
 
 int create_admin_completion_queue(struct nvme_dev *nvme) {
     nvme_cq *cq = &nvme->admin_cq;
+
+    cq->q.slots_free_write = nk_semaphore_create(0, cq->q.size + 1, 0, 0);
+    nk_semaphore_init(cq->q.slots_free_write);
+    cq->q.slots_free_read = nk_semaphore_create(0, 0, 0, 0);
+    nk_semaphore_init(cq->q.slots_free_read);
+    spinlock_init(&cq->q.lock);
+
     cq->q.size = NVME_ACQS;
     cq->buffer = (struct nvme_completion*)malloc(NVME_PAGE_SIZE); // sizeof(struct nvme_completion) * (cq->q.size + 1)?
     if (cq->buffer==NULL){
@@ -206,6 +209,13 @@ int create_admin_completion_queue(struct nvme_dev *nvme) {
 int create_io_submission_queue(struct nvme_dev *nvme, nvme_sq *sq) {
 	sq->q.size = 63;
     sq->q.addr = sq->buffer;
+
+    sq->q.slots_free_write = nk_semaphore_create(0, sq->q.size + 1, 0, 0);
+    nk_semaphore_init(sq->q.slots_free_write);
+    sq->q.slots_free_read = nk_semaphore_create(0, 0, 0, 0);
+    nk_semaphore_init(sq->q.slots_free_read);
+    spinlock_init(&sq->q.lock);
+
     DEBUG("io_sq addr: 0x%lx\n", sq->q.addr);
     if (sq->q.addr & 0xfff) {
         ERROR("IO submission queue address is not 12-bit aligned!\n");
@@ -224,6 +234,13 @@ int create_io_submission_queue(struct nvme_dev *nvme, nvme_sq *sq) {
 int create_io_completion_queue(struct nvme_dev *nvme, nvme_cq *cq) {
 	cq->q.size = 63;
     cq->q.addr = cq->buffer;
+
+    cq->q.slots_free_write = nk_semaphore_create(0, cq->q.size + 1, 0, 0);
+    nk_semaphore_init(cq->q.slots_free_write);
+    cq->q.slots_free_read = nk_semaphore_create(0, 0, 0, 0);
+    nk_semaphore_init(cq->q.slots_free_read);
+    spinlock_init(&cq->q.lock);
+
     // The address pointer is memory page aligned (based on the value in CC.MPS) unless otherwise specified
     DEBUG("io_cq addr: 0x%lx\n", cq->q.addr);
     if (cq->q.addr & 0xfff) {
@@ -253,11 +270,14 @@ static int nvme_queue_submit_cmd(struct nvme_dev *nvme, nvme_sq *sq, struct nvme
 
     uint16_t sq_tail_doorbell = 0x1000 + ((2*sq->q.id) * (4 << nvme->dstrd));    
     // enqueue command in submission queue
+    nk_semaphore_down(sq->q.slots_free_write);
+    spin_lock(&sq->q.lock);
 	sq->q.tail++;
-    if (sq->q.head == sq->q.tail + 1){
-        ERROR("Submission queue is full!\n");
-        return -1;
-    }
+    // if (sq->q.head == sq->q.tail + 1){
+    //     ERROR("Submission queue is full!\n");
+    //     spin_unlock(&sq->q.lock);
+    //     return -1;
+    // }
 	if (sq->q.tail == (sq->q.size + 1)){
         sq->q.tail = 0; // wrap
     }
@@ -269,12 +289,18 @@ static int nvme_queue_submit_cmd(struct nvme_dev *nvme, nvme_sq *sq, struct nvme
     // tail should be the index of the next *free* slot, not the one we just wrote to
     // DEBUG("cq_entry->phase_tag: %d\n", cq_entry->phase_tag);
     WRITE_MEM(nvme, sq_tail_doorbell, sq->q.tail);
+    spin_unlock(&sq->q.lock);
+    nk_semaphore_up(sq->q.slots_free_read);
+
+
     // DEBUG("waiting for command to be processed\n");
     // poll
     // hardware will invert phase tag bit upon every write to cq
     // we can use this to tell if the controller has written a new completion entry
     uint64_t timeout = 10000;
     uint64_t i = 0;
+    nk_semaphore_down(cq->q.slots_free_write);
+    spin_lock(&cq->q.lock);
     while(cq_entry->phase_tag == prev_phase_tag){
         // if (i>timeout){
         //     ERROR("Timed out waiting for command to be processed!\n");
@@ -286,16 +312,31 @@ static int nvme_queue_submit_cmd(struct nvme_dev *nvme, nvme_sq *sq, struct nvme
         i++;
         io_delay();
     };
+    spin_unlock(&cq->q.lock);
+    nk_semaphore_up(cq->q.slots_free_read);
+
+
     // DEBUG("cq_entry->phase_tag: %d\n", cq_entry->phase_tag);
     // DEBUG("command processed\n");
+    // controller tells us where the new sq head is depending on how many entries it has consumed
+    nk_semaphore_down(sq->q.slots_free_read);
+    spin_lock(&sq->q.lock);
+    sq->q.head = cq_entry->sq_head;
+    spin_unlock(&sq->q.lock);
+    nk_semaphore_up(sq->q.slots_free_write);
+ 
+
     uint16_t cq_head_doorbell = 0x1000 + (((2*cq->q.id) + 1) * (4 << nvme->dstrd));
     // dequeue completion from completion queue
+    nk_semaphore_down(cq->q.slots_free_read);
+    spin_lock(&cq->q.lock);
     cq->q.head++;
 	if (cq->q.head == (cq->q.size + 1)){
         cq->q.head = 0; // wrap
     }
-    // controller tells us where the new sq head is depending on how many entries it has consumed
-    sq->q.head = cq_entry->sq_head;  
+    spin_unlock(&cq->q.lock);
+    nk_semaphore_up(cq->q.slots_free_write);
+    
     // DEBUG("sq->head: %d\n", cq->head);
     // DEBUG("cq->head: %d\n", cq->head);
     // NOTE: *don't* overwrite consumed sq or cq entry or else undefined "hw" behavior
@@ -474,9 +515,14 @@ static int check_block_count(struct nvme_dev *nvme, uint64_t lba, uint64_t num_b
         ERROR("Block number or num_blocks out of bounds! lba: %lu, num_blocks: %lu, max num_blocks: %lu\n", lba, num_blocks, nvme->ns->nsze);
         return -1;
     }
-    uint64_t num_pages = num_blocks * ns_block_size / NVME_PAGE_SIZE; 
+    uint64_t num_pages = num_blocks * ns_block_size / NVME_PAGE_SIZE;
     if (num_pages > (NVME_NUM_PRP + 1) ) {
-        ERROR("Number of pages spanned exceeds prp list length: num_pages: %lu, max num_pages: %lu\n", num_pages, NVME_NUM_PRP + 1);
+        ERROR("Number of pages spanned exceeds prp list length! num_pages: %lu, max num_pages: %lu\n", num_pages, NVME_NUM_PRP + 1);
+        return -1;
+    }
+
+    if (num_blocks * ns_block_size > (1<<nvme->mdts)*nvme->mpsmin) {
+        ERROR("Maximum data transfer size exceeded! requested %lu, max allowed: %lu\n", num_blocks * ns_block_size, nvme->mdts);
         return -1;
     }
     // maybe need to check alignment?
@@ -795,7 +841,6 @@ int nk_nvme_init_register_blkdev(struct nvme_dev *state, uint16_t num) {
     }
     INFO("Added nvme device %s, type %s, blocksize=%lu, numblocks=%lu\n",
         blkdev_name,
-        state->type==HD ? "HD" : state->type==CD ? "CD" : "UNKNOWN", 
         state->block_size,state->num_blocks );
     num++;
     INFO("%s potentially operational\n",state->dev->name);
@@ -955,7 +1000,10 @@ int nk_nvme_init(struct naut_info *naut)
                 state->pci_dev = pdev;
 
                 // PCI/nautilus idependent
-                nvme_init_nvme_setup(state);
+                if (nvme_init_nvme_setup(state)) {
+                    ERROR("NVME init failed\n");
+                    return -1;
+                }
 
                 // now that we have block size and number of blocks, register block device (mostly copied from ata.c)
                 if (nk_nvme_init_register_blkdev(state, num)){
