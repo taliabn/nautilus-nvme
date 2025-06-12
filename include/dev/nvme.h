@@ -23,14 +23,13 @@
  */
 
 // Sources:
-    // https://github.com/torvalds/linux/tree/master/drivers/nvme
     // https://github.com/freebsd/freebsd-src/tree/main/sys/dev/nvme
     // https://wiki.osdev.org/NVMe
 
 #ifndef __NVME_H__
 #define __NVME_H__
 
-/* Work in progress NVMe driver*/
+/* NVMe driver*/
 int  nk_nvme_init(struct naut_info *naut);
 void nk_nvme_deinit();
 
@@ -67,19 +66,22 @@ void nk_nvme_deinit();
 // I'm confused
 #define NVME_MPS 1 // 4 bits wide
 #define NVME_PAGE_SIZE (1 << (12 + NVME_MPS)) // should be between 0x1000 and 0x10000 for QMEU's NVMe controller
-#define NVME_SQES 6 //  I/O Submission Queue Entry Size (specified as 2^n)
-#define NVME_CQES 4 //  I/O Completion Queue Entry Size (specified as 2^n)
+#define NVME_SQES 6 //  I/O Submission Queue Entry Size (specified as 2^n). Don't change!
+#define NVME_CQES 4 //  I/O Completion Queue Entry Size (specified as 2^n). Don't change!
+// Queue sizes can be changed
 // Admin queue sizes are 0's based and units are number of entries
 // Min number of entries is 2 and max number of entries is 4096
-#define NVME_ACQS 63 // Admin Completion Queue Size 
-#define NVME_ASQS 63 // Admin Submission Queue Size
+#define NVME_ACQS 64 // Admin Completion Queue Size 
+#define NVME_ASQS 64 // Admin Submission Queue Size
+#define NVME_IOCQS 64 // I/O Completion Queue Size 
+#define NVME_IOSQS 64 // I/O Submission Queue Size
 // for nvme get/set feature commands
 #define NVME_FEAT_NUMBER_OF_QUEUES 0x07
+
 /* NVMe types */
 
-
 /* Submission queue entries */
-struct nvme_command {
+struct nvme_command { // don't change!
     uint8_t opc;		/* opcode */
     uint8_t flags;		/* fused operation */
     uint16_t cid;		/* command identifier */
@@ -133,7 +135,6 @@ enum nvme_admin_opcode {
 	NVME_OPC_GET_FEATURES			= 0x0a,
 };
 
-
 // for identify admin command, which subsystem to get info about
 enum nvme_identify_cns{
     NAMESPACE       = 0x00,
@@ -142,7 +143,7 @@ enum nvme_identify_cns{
 };
 
 /* completion queue entry */
-struct nvme_completion {
+struct nvme_completion { // don't change!
     uint32_t cdw0;		/* command-specific */
     uint32_t rsvd1;		/* reserved */
     uint16_t sq_head;	/* submission queue head pointer */
