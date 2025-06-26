@@ -41,11 +41,10 @@
  */
 
 #include "nk/pte_osal.h"
+#include <stdint.h>
 
 #include "pthread.h"
 #include "implement.h"
-
-typedef long long int64_t;
 
 unsigned int
 pte_relmillisecs (const struct timespec * abstime)
