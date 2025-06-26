@@ -1877,6 +1877,8 @@ source "src/test/Kconfig"
 
 source "src/pass/Kconfig"
 
+source "scripts/extra/qemu/Kconfig"
+
 menu "Languages"
 
 	config LOAD_LUA

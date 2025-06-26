@@ -1,0 +1,64 @@
+
+menu "QEMU Options"
+
+# The options in this file should never be referenced inside the kernel
+# They are for configuring the "helper" command "make qemu" and "make qemu-gdb"
+# which tries to run the kernel inside the QEMU virtual machine.
+
+config QEMU_NUM_CPUS
+    int "Number of CPU(s)"
+    default 2
+    help
+      The number of SMP CPU(s) to run QEMU with.
+
+config QEMU_MEMORY_GB
+    int "GB of Memory"
+    default 4
+    help
+      Number of GB of memory to give the VM.
+
+config QEMU_NO_DISPLAY
+    bool "Disable the QEMU display"
+    default y
+    help
+      Do not open a monitor window when running the VM.
+
+
+menu "QEMU Devices"
+
+config QEMU_NVME_DRIVE
+    bool "Add an NVME Drive"
+    help
+      Add an NVME driver to the QEMU options passed to the kernel
+      Note: Does not enable the NVME driver. Please enable CONFIG_NVME.
+
+config QEMU_NVME_DRIVE_FILE_PATH
+    string "NVME Backing File Path"
+    default "./disk.img"
+    depends on QEMU_NVME_DRIVE
+    help
+      Path to a file to be used as the backing filesystem for the NVME drive.
+
+endmenu
+
+menu "GDB Server Options"
+
+config QEMU_GDB_SERVER_PORT
+    int "GDB Server Port"
+    default 1234
+    help
+      Which port to open a GDB server on when running "make qemu-gdb"
+
+config QEMU_GDB_BOOT_PAUSE
+    bool "Wait for GDB Client On Boot"
+    default n
+    help
+      Pass qemu the "-S" option which stops the VM from running any instructions
+      at boot until the client connects and tells it to continue.
+      Useful for debugging issues in the extremely early boot process.
+
+
+endmenu
+
+endmenu
+

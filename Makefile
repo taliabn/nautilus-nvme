@@ -170,7 +170,7 @@ $(LD_SCRIPT): $(LD_SCRIPT_SRC) $(AUTOCONF)
 # Extra rules for generating disassembly
 -include $(SCRIPTS_DIR)/extra/objdump.mk
 # Extra rules for running QEMU
--include $(SCRIPTS_DIR)/extra/qemu.mk
+-include $(SCRIPTS_DIR)/extra/qemu/rules.mk
 # Configuration for enabling stack protection with GCC
 -include $(SCRIPTS_DIR)/extra/stack_prot.mk
 
