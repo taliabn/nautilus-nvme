@@ -133,7 +133,7 @@ struct nk_gpu_dev_int boot_vga_dev_int = {
 
 static int
 boot_vga_dev_init(void) {
-    printk("boot_vga_dev_init!\n");
+    //printk("boot_vga_dev_init!\n");
 
     vga_init_screen();
 
