@@ -668,7 +668,7 @@ int nvme_init_check_cap(struct nvme_dev *state) {
     // Check the controller version is supported.
     volatile uint32_t version = READ_MEM(state, NVME_VS_OFFSET);
     if (version != NVME_VERSION){
-        ERROR("Unsupported NVME version 0x%08x\n", version);
+        ERROR("Unsupported NVME version 0x%08x (required=0x%08x)\n", version, (uint32_t)NVME_VERSION);
         return -1;
     }
     DEBUG("Supported NVME version 0x%08x found\n", version);
